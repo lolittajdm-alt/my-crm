@@ -26,8 +26,11 @@ git push -u origin main
 
 1. GitHub → ваш репозиторій → **Settings**
 2. **Pages** (ліворуч)
-3. **Build and deployment** → Source: **GitHub Actions**
-4. Зачекайте 1–2 хв — вкладка **Actions** покаже зелений deploy
+3. **Build and deployment** → Source: **Deploy from a branch**
+4. **Branch:** `gh-pages` → **`/ (root)`** → **Save**
+
+> Після першого push GitHub Actions створить гілку `gh-pages` (1–2 хв).
+> Якщо її ще немає — зачекайте зеленого deploy у **Actions**, потім оновіть Settings → Pages.
 
 ## 4. Ваш сайт
 
