@@ -270,7 +270,7 @@ const TASK_MAX_ATTACHMENTS = 10
 const TASK_MAX_FILE_BYTES = 2 * 1024 * 1024
 
 function savedToastMessage() {
-  return window.BazarioSync?.isReady?.() ? 'Збережено онлайн' : 'Збережено локально'
+  return window.BazarioSync?.isReady?.() ? 'Збережено · синхронізація щогодини' : 'Збережено локально'
 }
 
 function showToast(message) {
