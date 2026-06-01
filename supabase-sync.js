@@ -458,18 +458,30 @@ const BazarioSync = (() => {
   }
 
   async function afterAuth() {
-    const { data: { user }, error } = await state.client.auth.getUser()
-    if (error) throw error
-    state.user = user
-    await loadUserSession()
+    try {
+      const { data: { user }, error } = await state.client.auth.getUser()
+      if (error) throw error
+      state.user = user
+      await loadUserSession()
 
-    if (!state.workspaceId) {
+      if (!state.workspaceId) {
+        showOverlay()
+        renderAuthForm()
+        return
+      }
+
+      await finishSetup()
+    } catch (err) {
       showOverlay()
-      renderAuthForm()
-      return
+      const body = document.getElementById('authBody')
+      if (body) {
+        body.innerHTML = `
+          <h2 class="auth-title">Помилка</h2>
+          <p class="auth-subtitle">${esc(err.message || 'Не вдалося увійти')}</p>
+          <button type="button" class="btn-primary auth-submit" id="authRetryAfterAuth">Спробувати знову</button>`
+        document.getElementById('authRetryAfterAuth')?.addEventListener('click', afterAuth)
+      }
     }
-
-    await finishSetup()
   }
 
   async function signOut() {
@@ -494,30 +506,45 @@ const BazarioSync = (() => {
 
     state.onReady = onReady
     state.onRemoteChange = onRemoteChange
-    state.client = window.supabase.createClient(config().url, config().anonKey)
 
-    db().setSyncListener(handleLocalChange)
-
-    const { data: { session } } = await state.client.auth.getSession()
-    if (session?.user) {
-      state.user = session.user
-      showOverlay()
-      await afterAuth()
-    } else {
-      showOverlay()
-      renderAuthForm()
-    }
-
-    state.client.auth.onAuthStateChange(async (event, session) => {
-      if (event === 'SIGNED_OUT') {
-        state.user = null
-        state.ready = false
+    try {
+      if (!window.supabase?.createClient) {
+        throw new Error('Не завантажився Supabase SDK. Перевірте інтернет і оновіть сторінку.')
       }
-      if (event === 'SIGNED_IN' && session?.user && !state.ready) {
+      state.client = window.supabase.createClient(config().url, config().anonKey)
+      db().setSyncListener(handleLocalChange)
+
+      const { data: { session } } = await state.client.auth.getSession()
+      if (session?.user) {
         state.user = session.user
+        showOverlay()
         await afterAuth()
+      } else {
+        showOverlay()
+        renderAuthForm()
       }
-    })
+
+      state.client.auth.onAuthStateChange(async (event, session) => {
+        if (event === 'SIGNED_OUT') {
+          state.user = null
+          state.ready = false
+        }
+        if (event === 'SIGNED_IN' && session?.user && !state.ready) {
+          state.user = session.user
+          await afterAuth()
+        }
+      })
+    } catch (err) {
+      showOverlay()
+      const body = document.getElementById('authBody')
+      if (body) {
+        body.innerHTML = `
+          <h2 class="auth-title">Помилка</h2>
+          <p class="auth-subtitle">${esc(err.message || 'Не вдалося підключити Supabase')}</p>
+          <button type="button" class="btn-primary auth-submit" id="authRetryInit">Спробувати знову</button>`
+        document.getElementById('authRetryInit')?.addEventListener('click', () => init({ onReady, onRemoteChange }))
+      }
+    }
 
     return true
   }

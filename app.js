@@ -3486,8 +3486,11 @@ function initAccountingNavLinks() {
 
 function renderHome() {
   const stats = db.getStats()
-  const p = db.getProfile()
+  const onlineEmptyHint = window.BazarioSync?.isReady?.() && !stats.productsCount && !stats.financeExpenses && !db.list('orderTransactions').length
+    ? `<div class="empty-hint home-online-empty-hint">База порожня. Якщо дані були на localhost — увійдіть тим самим email. Або додайте товари / фінанси вручну.</div>`
+    : ''
   return `
+    ${onlineEmptyHint}
     <div class="home-greeting" data-searchable>
       <h1 class="greeting-title">Вітаємо, <span class="name-highlight">${escapeHtml(db.getFirstName())}</span></h1>
       <div class="team" title="${escapeHtml(db.getFullName())}">
@@ -13523,6 +13526,8 @@ function startApp() {
   render()
 }
 
+startApp()
+
 if (window.BazarioSync?.isEnabled()) {
   BazarioSync.init({
     onReady: startApp,
@@ -13531,6 +13536,4 @@ if (window.BazarioSync?.isEnabled()) {
       render()
     },
   })
-} else {
-  startApp()
 }
