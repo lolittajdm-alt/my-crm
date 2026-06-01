@@ -31,6 +31,52 @@ const BazarioSync = (() => {
 
   let overlayEl = null
   let authMode = 'login'
+  const recentLocalWrites = new Set()
+  const pendingUpserts = new Map()
+  let flushUpsertsTimer = null
+  let remoteChangeTimer = null
+
+  function markLocalWrite(collection, id) {
+    if (!collection || !id) return
+    const key = `${collection}:${id}`
+    recentLocalWrites.add(key)
+    setTimeout(() => recentLocalWrites.delete(key), 2500)
+  }
+
+  function isOwnWriteEcho(collection, id) {
+    if (!collection || !id) return false
+    return recentLocalWrites.has(`${collection}:${id}`)
+  }
+
+  function scheduleRemoteChange() {
+    clearTimeout(remoteChangeTimer)
+    remoteChangeTimer = setTimeout(() => {
+      remoteChangeTimer = null
+      state.onRemoteChange?.()
+    }, 450)
+  }
+
+  function queueUpsert(collection, record) {
+    pendingUpserts.set(`${collection}:${record.id}`, { collection, record })
+    clearTimeout(flushUpsertsTimer)
+    flushUpsertsTimer = setTimeout(flushPendingUpserts, 350)
+  }
+
+  async function flushPendingUpserts() {
+    flushUpsertsTimer = null
+    if (!state.workspaceId || state.syncing || !pendingUpserts.size) return
+    const batch = [...pendingUpserts.values()]
+    pendingUpserts.clear()
+    const rows = batch.map(({ collection, record }) => ({
+      id: record.id,
+      workspace_id: state.workspaceId,
+      collection,
+      payload: record,
+      updated_at: record.updatedAt || new Date().toISOString(),
+    }))
+    const { error } = await state.client.from('app_records').upsert(rows)
+    if (error) console.warn('BazarioSync batch upsert:', error.message)
+  }
 
   function config() {
     return window.BAZARIO_SUPABASE || {}
@@ -340,19 +386,14 @@ const BazarioSync = (() => {
   }
 
   async function upsertRecord(collection, record) {
-    if (!state.workspaceId || state.syncing) return
-    const { error } = await state.client.from('app_records').upsert({
-      id: record.id,
-      workspace_id: state.workspaceId,
-      collection,
-      payload: record,
-      updated_at: record.updatedAt || new Date().toISOString(),
-    })
-    if (error) console.warn('BazarioSync upsert:', error.message)
+    if (!state.workspaceId || state.syncing || !record?.id) return
+    markLocalWrite(collection, record.id)
+    queueUpsert(collection, record)
   }
 
   async function deleteRecord(collection, id) {
-    if (!state.workspaceId || state.syncing) return
+    if (!state.workspaceId || state.syncing || !id) return
+    markLocalWrite(collection, id)
     const { error } = await state.client
       .from('app_records')
       .delete()
@@ -373,15 +414,17 @@ const BazarioSync = (() => {
 
   function applyRemoteRow(row) {
     if (!row?.collection || !COLLECTIONS.includes(row.collection)) return
+    const recordId = row.payload?.id
+    if (recordId && isOwnWriteEcho(row.collection, recordId)) return
+
     db().setApplyingRemote(true)
     try {
       const items = db().list(row.collection)
-      const recordId = row.payload?.id
       if (row.eventType === 'DELETE') {
         if (recordId) db().write(row.collection, items.filter((i) => i.id !== recordId))
         return
       }
-      if (!row.payload?.id) return
+      if (!recordId) return
       const idx = items.findIndex((i) => i.id === row.payload.id)
       if (idx === -1) items.unshift(row.payload)
       else items[idx] = row.payload
@@ -389,7 +432,7 @@ const BazarioSync = (() => {
     } finally {
       db().setApplyingRemote(false)
     }
-    state.onRemoteChange?.()
+    scheduleRemoteChange()
   }
 
   function subscribeRealtime() {
@@ -439,6 +482,7 @@ const BazarioSync = (() => {
       else await pullRemote()
 
       subscribeRealtime()
+      await flushPendingUpserts()
       state.ready = true
       hideOverlay()
       ensureLogoutButton()
