@@ -1,0 +1,65 @@
+.cardVisual {
+  position: relative;
+  aspect-ratio: 1.6 / 1;
+  min-height: 160px;
+  padding: 24px;
+  border-radius: 20px;
+  background: linear-gradient(135deg, #9bb0d4 0%, #6b85b5 50%, #8da3cf 100%);
+  color: #fff;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+}
+
+.chip {
+  width: 36px;
+  height: 28px;
+  border-radius: 6px;
+  background: linear-gradient(145deg, #e8d5a0 0%, #c9a84a 100%);
+  opacity: 0.9;
+}
+
+.bankName {
+  font-size: 14px;
+  font-weight: 600;
+  opacity: 0.95;
+  margin-top: 16px;
+}
+
+.id {
+  font-size: 18px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  margin-top: 4px;
+}
+
+.location {
+  font-size: 11px;
+  opacity: 0.8;
+  margin-top: auto;
+}
+
+.capacity {
+  font-size: 12px;
+  font-weight: 500;
+  opacity: 0.9;
+}
+
+.waves {
+  position: absolute;
+  right: -20%;
+  bottom: -30%;
+  width: 70%;
+  height: 70%;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.waves::after {
+  content: '';
+  position: absolute;
+  inset: 20%;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.06);
+}

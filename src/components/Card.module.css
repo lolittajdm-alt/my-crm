@@ -1,0 +1,37 @@
+.card {
+  background: var(--bg-card);
+  border-radius: var(--radius-card);
+  padding: 24px;
+  box-shadow: var(--shadow-card);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.wide {
+  grid-column: span 1;
+}
+
+.head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 20px;
+}
+
+.head h2 {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.more {
+  color: var(--text-muted);
+  padding: 4px;
+  border-radius: 8px;
+}
+
+.more:hover {
+  color: var(--text-secondary);
+  background: var(--bg-page);
+}

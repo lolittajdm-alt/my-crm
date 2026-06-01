@@ -1,0 +1,43 @@
+.banner {
+  background: var(--bg-sidebar);
+  border-radius: var(--radius-card);
+  padding: 24px;
+  color: #fff;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  min-height: 160px;
+  justify-content: space-between;
+}
+
+.icon {
+  opacity: 0.9;
+  color: var(--accent-blue);
+}
+
+.title {
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.sub {
+  font-size: 12px;
+  opacity: 0.65;
+  margin-top: 4px;
+}
+
+.btn {
+  align-self: flex-start;
+  padding: 12px 24px;
+  background: #fff;
+  color: var(--bg-sidebar);
+  font-size: 13px;
+  font-weight: 600;
+  border-radius: var(--radius-pill);
+  transition: transform 0.15s, opacity 0.15s;
+}
+
+.btn:hover {
+  transform: scale(1.02);
+  opacity: 0.95;
+}

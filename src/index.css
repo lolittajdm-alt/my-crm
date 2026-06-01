@@ -1,0 +1,57 @@
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+:root {
+  --bg-page: #ebebeb;
+  --bg-card: #ffffff;
+  --bg-sidebar: #1a1a1a;
+  --bg-sidebar-bottom: #141414;
+  --text-primary: #1a1a1a;
+  --text-secondary: #8a8a8a;
+  --text-muted: #b0b0b0;
+  --accent-blue: #8da3cf;
+  --accent-blue-dark: #6b85b5;
+  --accent-yellow: #e8c96a;
+  --accent-coral: #e8a0a0;
+  --accent-green: #9bc49b;
+  --shadow-card: 0 4px 24px rgba(0, 0, 0, 0.06);
+  --radius-shell: 32px;
+  --radius-card: 24px;
+  --radius-pill: 999px;
+  --font: 'Inter', system-ui, -apple-system, sans-serif;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  font-family: var(--font);
+  background: #d8d8d8;
+  color: var(--text-primary);
+  -webkit-font-smoothing: antialiased;
+}
+
+button {
+  font-family: inherit;
+  cursor: pointer;
+  border: none;
+  background: none;
+}
+
+input {
+  font-family: inherit;
+  border: none;
+  outline: none;
+}
+
+ul {
+  list-style: none;
+}

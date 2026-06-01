@@ -1,0 +1,29 @@
+{
+  "name": "MY CRM",
+  "short_name": "MY CRM",
+  "description": "MY CRM — облік складу та продажів",
+  "start_url": "./",
+  "display": "standalone",
+  "background_color": "#ebebeb",
+  "theme_color": "#1a1a1a",
+  "icons": [
+    {
+      "src": "assets/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    },
+    {
+      "src": "assets/apple-touch-icon.png",
+      "sizes": "180x180",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "assets/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}
