@@ -1692,7 +1692,7 @@ function financeSummaryCard(stats) {
 }
 
 function incomeCard() {
-  const total = getFinancePageData().income
+  const total = getFinancePageDataCached().income
   const share = total / 2
   return card('Дохід', `
     <div class="stock-top">
@@ -9481,6 +9481,13 @@ function renderFinanceAccountsToggle() {
     </button>`
 }
 
+let financePageDataPassCache = null
+
+function getFinancePageDataCached() {
+  if (!financePageDataPassCache) financePageDataPassCache = getFinancePageData()
+  return financePageDataPassCache
+}
+
 function getFinancePageData() {
   const financeItems = db.list('finance')
   const accounts = db.list('accounts')
@@ -13483,6 +13490,7 @@ function renderNav({ animate = false } = {}) {
 }
 
 function render() {
+  financePageDataPassCache = null
   syncCurrentUserRoleFromProfileRecord()
   syncHeader()
   renderContent()
@@ -13522,6 +13530,16 @@ searchInputEl.addEventListener('input', (e) => {
 
 window.addEventListener('pagehide', persistAppNavState)
 
+let remoteRenderTimer = null
+function scheduleRemoteRender() {
+  clearTimeout(remoteRenderTimer)
+  remoteRenderTimer = setTimeout(() => {
+    remoteRenderTimer = null
+    syncHeader()
+    render()
+  }, 450)
+}
+
 function startApp() {
   render()
 }
@@ -13531,9 +13549,6 @@ startApp()
 if (window.BazarioSync?.isEnabled()) {
   BazarioSync.init({
     onReady: startApp,
-    onRemoteChange: () => {
-      syncHeader()
-      render()
-    },
+    onRemoteChange: scheduleRemoteRender,
   })
 }
