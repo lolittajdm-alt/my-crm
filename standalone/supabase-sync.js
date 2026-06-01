@@ -1,8 +1,10 @@
 /**
  * Bazario — Supabase auth + sync for shared online workspace.
- * Requires: supabase-config.js, @supabase/supabase-js (CDN), storage.js
+ * Sync interval: once per hour (no realtime).
  */
 const BazarioSync = (() => {
+  const SYNC_INTERVAL_MS = 60 * 60 * 1000
+
   const COLLECTIONS = [
     'warehouses',
     'products',
@@ -24,59 +26,16 @@ const BazarioSync = (() => {
     workspaceName: null,
     ready: false,
     syncing: false,
-    channel: null,
+    dirty: false,
+    lastSyncAt: null,
     onReady: null,
     onRemoteChange: null,
   }
 
   let overlayEl = null
   let authMode = 'login'
-  const recentLocalWrites = new Set()
-  const pendingUpserts = new Map()
-  let flushUpsertsTimer = null
-  let remoteChangeTimer = null
-
-  function markLocalWrite(collection, id) {
-    if (!collection || !id) return
-    const key = `${collection}:${id}`
-    recentLocalWrites.add(key)
-    setTimeout(() => recentLocalWrites.delete(key), 2500)
-  }
-
-  function isOwnWriteEcho(collection, id) {
-    if (!collection || !id) return false
-    return recentLocalWrites.has(`${collection}:${id}`)
-  }
-
-  function scheduleRemoteChange() {
-    clearTimeout(remoteChangeTimer)
-    remoteChangeTimer = setTimeout(() => {
-      remoteChangeTimer = null
-      state.onRemoteChange?.()
-    }, 450)
-  }
-
-  function queueUpsert(collection, record) {
-    pendingUpserts.set(`${collection}:${record.id}`, { collection, record })
-    clearTimeout(flushUpsertsTimer)
-    flushUpsertsTimer = setTimeout(flushPendingUpserts, 350)
-  }
-
-  async function flushPendingUpserts() {
-    flushUpsertsTimer = null
-    if (!state.workspaceId || state.syncing || !pendingUpserts.size) return
-    const batch = [...pendingUpserts.values()]
-    pendingUpserts.clear()
-    const rows = batch.map(({ collection, record }) => ({
-      id: record.id,
-      workspace_id: state.workspaceId,
-      collection,
-      payload: record,
-      updated_at: record.updatedAt || new Date().toISOString(),
-    }))
-    const { error } = await state.client.from('app_records').upsert(rows)
-    if (error) console.warn('BazarioSync batch upsert:', error.message)
-  }
+  let syncTimer = null
+  const pendingDeletes = []
 
   function config() {
     return window.BAZARIO_SUPABASE || {}
@@ -101,6 +60,11 @@ const BazarioSync = (() => {
     if (!el) return
     el.textContent = message || ''
     el.hidden = !message
+  }
+
+  function formatSyncTime(ts) {
+    if (!ts) return '—'
+    return new Date(ts).toLocaleTimeString('uk-UA', { hour: '2-digit', minute: '2-digit' })
   }
 
   function ensureOverlay() {
@@ -209,7 +173,23 @@ const BazarioSync = (() => {
       return
     }
     const code = state.inviteCode ? ` · код: ${state.inviteCode}` : ''
-    el.textContent = `Онлайн · ${state.workspaceName || 'Supabase'}${code}`
+    const last = formatSyncTime(state.lastSyncAt)
+    const pending = state.dirty ? ' · є не синхронізовані зміни' : ''
+    el.textContent = `Онлайн · ${state.workspaceName || 'Supabase'}${code} · синхр. щогодини · остання: ${last}${pending}`
+  }
+
+  function stopPeriodicSync() {
+    if (syncTimer) {
+      clearInterval(syncTimer)
+      syncTimer = null
+    }
+  }
+
+  function startPeriodicSync() {
+    stopPeriodicSync()
+    syncTimer = setInterval(() => {
+      runScheduledSync({ silent: true })
+    }, SYNC_INTERVAL_MS)
   }
 
   async function handleAuthSubmit(e) {
@@ -374,26 +354,20 @@ const BazarioSync = (() => {
         })
       }
     }
-    if (!records.length) return
-    const chunkSize = 200
-    for (let i = 0; i < records.length; i += chunkSize) {
-      const chunk = records.slice(i, i + chunkSize)
-      const { error } = await state.client.from('app_records').upsert(chunk)
-      if (error) throw error
+    if (records.length) {
+      const chunkSize = 200
+      for (let i = 0; i < records.length; i += chunkSize) {
+        const chunk = records.slice(i, i + chunkSize)
+        const { error } = await state.client.from('app_records').upsert(chunk)
+        if (error) throw error
+      }
     }
     await saveUserProfile(db().getProfile())
     await saveWorkspaceSettings(db().getSettings())
   }
 
-  async function upsertRecord(collection, record) {
-    if (!state.workspaceId || state.syncing || !record?.id) return
-    markLocalWrite(collection, record.id)
-    queueUpsert(collection, record)
-  }
-
-  async function deleteRecord(collection, id) {
-    if (!state.workspaceId || state.syncing || !id) return
-    markLocalWrite(collection, id)
+  async function deleteRemoteRecord(collection, id) {
+    if (!state.workspaceId || !collection || !id) return
     const { error } = await state.client
       .from('app_records')
       .delete()
@@ -403,66 +377,69 @@ const BazarioSync = (() => {
     if (error) console.warn('BazarioSync delete:', error.message)
   }
 
+  async function flushPendingDeletes() {
+    if (!pendingDeletes.length) return
+    const batch = [...pendingDeletes]
+    pendingDeletes.length = 0
+    for (const item of batch) {
+      await deleteRemoteRecord(item.collection, item.id)
+    }
+  }
+
   function handleLocalChange(event) {
     if (!state.ready || state.syncing) return
-    if (event.type === 'upsert') upsertRecord(event.collection, event.record)
-    else if (event.type === 'delete') deleteRecord(event.collection, event.id)
-    else if (event.type === 'profile') saveUserProfile(event.data)
-    else if (event.type === 'settings') saveWorkspaceSettings(event.data)
-    else if (event.type === 'full') pushLocalToRemote()
+    state.dirty = true
+    if (event.type === 'delete') {
+      pendingDeletes.push({ collection: event.collection, id: event.id })
+    }
+    updateStorageHint()
   }
 
-  function applyRemoteRow(row) {
-    if (!row?.collection || !COLLECTIONS.includes(row.collection)) return
-    const recordId = row.payload?.id
-    if (recordId && isOwnWriteEcho(row.collection, recordId)) return
+  async function runScheduledSync({ silent = false, initial = false } = {}) {
+    if (!state.workspaceId || state.syncing) return false
 
-    db().setApplyingRemote(true)
+    state.syncing = true
+    const hintEl = document.getElementById('storageHint')
+    const prevHint = hintEl?.textContent
+    if (!silent && hintEl) hintEl.textContent = 'Синхронізація з базою…'
+
     try {
-      const items = db().list(row.collection)
-      if (row.eventType === 'DELETE') {
-        if (recordId) db().write(row.collection, items.filter((i) => i.id !== recordId))
-        return
+      if (initial) {
+        const { count, error: countError } = await state.client
+          .from('app_records')
+          .select('*', { count: 'exact', head: true })
+          .eq('workspace_id', state.workspaceId)
+        if (countError) throw countError
+        if (!count) {
+          await pushLocalToRemote()
+        } else {
+          await pullRemote()
+          await flushPendingDeletes()
+          await pushLocalToRemote()
+          await pullRemote()
+        }
+      } else {
+        await flushPendingDeletes()
+        await pushLocalToRemote()
+        await pullRemote()
       }
-      if (!recordId) return
-      const idx = items.findIndex((i) => i.id === row.payload.id)
-      if (idx === -1) items.unshift(row.payload)
-      else items[idx] = row.payload
-      db().write(row.collection, items)
-    } finally {
-      db().setApplyingRemote(false)
-    }
-    scheduleRemoteChange()
-  }
 
-  function subscribeRealtime() {
-    if (state.channel) {
-      state.client.removeChannel(state.channel)
-      state.channel = null
+      state.lastSyncAt = Date.now()
+      state.dirty = false
+      updateStorageHint()
+      state.onRemoteChange?.()
+      return true
+    } catch (err) {
+      console.warn('BazarioSync:', err.message)
+      if (hintEl && prevHint) hintEl.textContent = prevHint
+      updateStorageHint()
+      return false
+    } finally {
+      state.syncing = false
     }
-    state.channel = state.client
-      .channel(`workspace-${state.workspaceId}`)
-      .on(
-        'postgres_changes',
-        {
-          event: '*',
-          schema: 'public',
-          table: 'app_records',
-          filter: `workspace_id=eq.${state.workspaceId}`,
-        },
-        (payload) => {
-          applyRemoteRow({
-            collection: payload.new?.collection || payload.old?.collection,
-            payload: payload.new?.payload || payload.old?.payload,
-            eventType: payload.eventType,
-          })
-        },
-      )
-      .subscribe()
   }
 
   async function finishSetup() {
-    state.syncing = true
     showOverlay()
     const body = document.getElementById('authBody')
     if (body) {
@@ -471,33 +448,22 @@ const BazarioSync = (() => {
         <p class="auth-subtitle">Завантажуємо дані з хмари…</p>`
     }
 
-    try {
-      const { count, error: countError } = await state.client
-        .from('app_records')
-        .select('*', { count: 'exact', head: true })
-        .eq('workspace_id', state.workspaceId)
-      if (countError) throw countError
-
-      if (!count) await pushLocalToRemote()
-      else await pullRemote()
-
-      subscribeRealtime()
-      await flushPendingUpserts()
+    const ok = await runScheduledSync({ initial: true })
+    if (ok) {
       state.ready = true
       hideOverlay()
       ensureLogoutButton()
-      updateStorageHint()
+      startPeriodicSync()
       state.onReady?.()
-    } catch (err) {
-      if (body) {
-        body.innerHTML = `
-          <h2 class="auth-title">Помилка</h2>
-          <p class="auth-subtitle">${esc(err.message || 'Не вдалося синхронізувати')}</p>
-          <button type="button" class="btn-primary auth-submit" id="authRetrySync">Спробувати знову</button>`
-        document.getElementById('authRetrySync')?.addEventListener('click', finishSetup)
-      }
-    } finally {
-      state.syncing = false
+      return
+    }
+
+    if (body) {
+      body.innerHTML = `
+        <h2 class="auth-title">Помилка</h2>
+        <p class="auth-subtitle">Не вдалося синхронізувати дані</p>
+        <button type="button" class="btn-primary auth-submit" id="authRetrySync">Спробувати знову</button>`
+      document.getElementById('authRetrySync')?.addEventListener('click', finishSetup)
     }
   }
 
@@ -529,14 +495,17 @@ const BazarioSync = (() => {
   }
 
   async function signOut() {
+    if (state.dirty && state.ready) {
+      await runScheduledSync({ silent: true })
+    }
+    stopPeriodicSync()
     state.ready = false
     state.workspaceId = null
     state.inviteCode = null
-    if (state.channel) {
-      await state.client.removeChannel(state.channel)
-      state.channel = null
-    }
-    await state.client.auth.signOut()
+    state.dirty = false
+    state.lastSyncAt = null
+    pendingDeletes.length = 0
+    await state.client?.auth.signOut()
     state.user = null
     authMode = 'login'
     ensureLogoutButton()
@@ -557,6 +526,14 @@ const BazarioSync = (() => {
       }
       state.client = window.supabase.createClient(config().url, config().anonKey)
       db().setSyncListener(handleLocalChange)
+
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState !== 'visible' || !state.ready) return
+        const elapsed = state.lastSyncAt ? Date.now() - state.lastSyncAt : SYNC_INTERVAL_MS
+        if (elapsed >= SYNC_INTERVAL_MS || state.dirty) {
+          runScheduledSync({ silent: true })
+        }
+      })
 
       const { data: { session } } = await state.client.auth.getSession()
       if (session?.user) {
@@ -598,7 +575,9 @@ const BazarioSync = (() => {
     isEnabled,
     isReady: () => state.ready,
     signOut,
+    syncNow: () => runScheduledSync({ silent: false }),
     getInviteCode: () => state.inviteCode,
+    getLastSyncAt: () => state.lastSyncAt,
   }
 })()
 
