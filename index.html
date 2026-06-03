@@ -13,7 +13,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="styles.css?v=317" />
+  <link rel="stylesheet" href="styles.css?v=337" />
 </head>
 <body>
   <div class="shell">
@@ -37,6 +37,7 @@
               <input type="search" id="searchInput" placeholder="Пошук..." />
             </label>
             <div class="notifications-wrap">
+              <div class="order-push-stack" id="orderPushStack" aria-live="polite" aria-relevant="additions"></div>
               <button type="button" class="notifications-btn" id="notificationsBtn" aria-label="Сповіщення" aria-expanded="false" aria-haspopup="true">
                 <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
                   <path d="M18 8a6 6 0 10-12 0c0 7-3 9-3 9h18s-3-2-3-9" stroke-linecap="round" stroke-linejoin="round"/>
@@ -47,6 +48,7 @@
               <div class="notifications-panel is-hidden" id="notificationsPanel" role="region" aria-labelledby="notificationsTitle">
                 <div class="notifications-panel-head">
                   <h2 class="notifications-panel-title" id="notificationsTitle">Сповіщення</h2>
+                  <button type="button" class="notifications-clear-btn" id="clearViewedNotificationsBtn" hidden>Видалити переглянуті</button>
                 </div>
                 <div class="notifications-panel-body" id="notificationsContent"></div>
               </div>
@@ -59,11 +61,61 @@
       </main>
     </div>
   </div>
+  <div class="modal-overlay is-hidden" id="telegramMessageModal" aria-hidden="true">
+    <div class="modal card telegram-message-modal" role="dialog" aria-labelledby="telegramMessageModalTitle">
+      <div class="card-head modal-head">
+        <div class="telegram-message-modal-head">
+          <span class="notifications-telegram-badge">Telegram</span>
+          <h2 id="telegramMessageModalTitle">—</h2>
+        </div>
+        <button type="button" class="btn-icon modal-close" id="telegramMessageModalClose" aria-label="Закрити">×</button>
+      </div>
+      <p class="telegram-message-modal-meta" id="telegramMessageModalMeta"></p>
+      <div class="telegram-message-modal-text" id="telegramMessageModalText"></div>
+      <div class="modal-actions telegram-message-modal-actions">
+        <button type="button" class="btn-secondary" id="telegramMessageModalOpenTg" hidden>Відкрити в Telegram</button>
+        <button type="button" class="btn-primary" id="telegramMessageModalOk">Закрити</button>
+      </div>
+    </div>
+  </div>
   <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+  <script src="api-base.js?v=1"></script>
+  <script src="api-origin.js?v=1"></script>
   <script src="supabase-config.js?v=2"></script>
+  <script>
+    window.BAZARIO_ROZETKA = Object.assign({
+      apiToken: '',
+      username: '',
+      password: '',
+      shop: 'Bazario',
+      apiBase: '/api/rozetka',
+      syncFromDate: '2026-06-01',
+      autoSyncMinutes: 15,
+    }, window.BAZARIO_ROZETKA || {});
+  </script>
+  <script src="rozetka-config.js?v=2"></script>
+  <script>
+    window.BAZARIO_TELEGRAM = Object.assign({
+      mode: 'bot',
+      botToken: '',
+      chatIds: '',
+      chatId: '',
+      userApiBase: '/api/telegram-user',
+      userEnabled: true,
+      apiBase: '/api/telegram',
+      pollIntervalSeconds: 8,
+      maxStoredMessages: 80,
+      enabled: true,
+    }, window.BAZARIO_TELEGRAM || {});
+  </script>
+  <script src="telegram-config.js?v=1"></script>
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
   <script src="storage.js?v=203"></script>
-  <script src="supabase-sync.js?v=4"></script>
-  <script src="app.js?v=374"></script>
+  <script src="supabase-sync.js?v=5"></script>
+  <script src="rozetka-sync.js?v=22"></script>
+  <script src="telegram-sync.js?v=3"></script>
+  <script src="device-notifications.js?v=2"></script>
+  <script src="animations.js?v=6"></script>
+  <script src="app.js?v=416"></script>
 </body>
 </html>
