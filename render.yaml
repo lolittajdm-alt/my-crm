@@ -1,0 +1,35 @@
+# Render Blueprint: CRM + Rozetka + Telegram API на одному URL
+# https://render.com/docs/blueprint-spec
+services:
+  - type: web
+    name: my-crm
+    runtime: node
+    plan: free
+    buildCommand: npm install && node tools/build-deploy-config.mjs
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      # Захист API (обовʼязково для публічного хостингу):
+      - key: BAZARIO_API_KEY
+        generateValue: true
+      # Telegram User API (групи без адміна):
+      - key: TELEGRAM_API_ID
+        sync: false
+      - key: TELEGRAM_API_HASH
+        sync: false
+      - key: TELEGRAM_SESSION
+        sync: false
+      - key: TELEGRAM_CHAT_IDS
+        sync: false
+      - key: TELEGRAM_MODE
+        value: user
+      - key: ROZETKA_API_TOKEN
+        sync: false
+      - key: ROZETKA_USERNAME
+        sync: false
+      - key: ROZETKA_PASSWORD
+        sync: false
+      - key: ROZETKA_SHOP
+        sync: false

@@ -303,7 +303,50 @@ const BazarioSync = (() => {
   }
 
   function applyCollection(collection, records) {
+    if (collection === 'orderTransactions') {
+      db().write(collection, mergeRemoteOrderTransactions(records))
+      return
+    }
     db().write(collection, records)
+  }
+
+  function shouldKeepLocalTtnComment(local, remote) {
+    if (!local) return false
+    if (local.ttnCommentManual) return true
+    const localTtn = String(local.ttnComment ?? '').trim()
+    const remoteTtn = String(remote?.ttnComment ?? '').trim()
+    if (!localTtn) return false
+    if (localTtn === remoteTtn) return false
+    const localTs = new Date(local.updatedAt || 0).getTime()
+    const remoteTs = new Date(remote?.updatedAt || 0).getTime()
+    return localTs >= remoteTs
+  }
+
+  function shouldKeepLocalOrderStatus(local) {
+    return Boolean(local?.statusManual)
+  }
+
+  function mergeRemoteOrderTransactions(remoteRecords) {
+    const localById = new Map(db().list('orderTransactions').map((item) => [item.id, item]))
+    return (remoteRecords || []).map((remote) => {
+      const local = localById.get(remote.id)
+      const keepTtn = shouldKeepLocalTtnComment(local, remote)
+      const keepStatus = shouldKeepLocalOrderStatus(local)
+      if (!keepTtn && !keepStatus) return remote
+      return {
+        ...remote,
+        ...(keepTtn
+          ? { ttnComment: local.ttnComment, ttnCommentManual: local.ttnCommentManual }
+          : {}),
+        ...(keepStatus
+          ? {
+            status: local.status,
+            statusHistory: local.statusHistory,
+            statusManual: local.statusManual,
+          }
+          : {}),
+      }
+    })
   }
 
   async function pullRemote() {

@@ -50,10 +50,42 @@ const profileRoles = ['Адміністратор', 'Менеджер', 'Кор�
 
 const accountDeliveryStatuses = ['Оформлений', 'В дорозі', 'На відділенні', 'Доставлений', 'Відмова']
 const accountPaymentTypes = ['Товар', 'Доставка', 'Товар+Доставка']
-const bazarioOrderStatuses = ['Нове Замовлення', 'В обробці', 'Продаж', 'Відправлено', 'Доставляється', 'Очікує на відділенні', 'ПОВЕРНУТО', '-', 'Оформлено']
+const bazarioOrderStatuses = ['Нове Замовлення', 'В обробці', 'Продаж', 'Розпродаж', 'Відправлено', 'Доставляється', 'Очікує на відділенні', 'ПОВЕРНУТО', '-', 'Оформлено']
 const ORDER_TRANSACTION_SALE_STATUS = 'Продаж'
 const ORDER_TRANSACTION_CLEARANCE_STATUS = 'Розпродаж'
+const ORDER_TRANSACTION_IN_PROCESSING_STATUS = 'В обробці'
+/** Rozetka / завершені замовлення, що рахуються як продаж і списання зі складу */
+const ORDER_TRANSACTION_COMPLETED_SALE_PATTERNS = [
+  /^замовлення виконано$/,
+  /виконано автоматично/,
+  /^отримано$/,
+]
 const bazarioDeliveryOptions = ['Нова Пошта', 'Rozetka']
+const MARKETPLACE_HIGHLIGHT_CLASSES = ['marketplace-bg--rozetka', 'marketplace-bg--nova-poshta']
+
+function marketplaceHighlightClass(label) {
+  const value = String(label || '').trim().toLowerCase()
+  if (!value || value === '—') return ''
+  if ((value.includes('нова') && value.includes('пошт')) || (value.includes('nova') && value.includes('poshta'))) {
+    return 'marketplace-bg--nova-poshta'
+  }
+  if (value === 'rozetka' || value.includes('rozetka')) return 'marketplace-bg--rozetka'
+  return ''
+}
+
+function applyMarketplaceHighlight(el, label) {
+  if (!el) return
+  MARKETPLACE_HIGHLIGHT_CLASSES.forEach((cls) => el.classList.remove(cls))
+  const cls = marketplaceHighlightClass(label)
+  if (cls) el.classList.add(cls)
+}
+
+function marketplaceFieldWrap(label, content, { html = false } = {}) {
+  const cls = marketplaceHighlightClass(label)
+  const wrapCls = `account-pick-wrap marketplace-field-wrap${cls ? ` ${cls}` : ''}`
+  const inner = html ? content : escapeHtml(content || '—')
+  return `<span class="${wrapCls}"><span class="account-pick-value">${inner}</span></span>`
+}
 const ORDER_TRANSACTION_ROZETKA_DELIVERY_COMMISSION = 30
 const ARTICLE_PREFIX = 'Код: '
 
@@ -167,6 +199,14 @@ let productCatalogPickerOpen = false
 /** @type {'zakupka'|'stock'} */
 let productAddModalMode = 'zakupka'
 let notificationsOpen = false
+/** @type {Map<string, string>|null} orderId → останній відомий статус для push */
+let orderNotificationStatusSnapshot = null
+let telegramNotificationPushSnapshot = null
+let telegramUserServerStatus = null
+let taskNotificationPushSnapshot = null
+const ORDER_PUSH_MAX_VISIBLE = 3
+const ORDER_PUSH_AUTO_DISMISS_MS = 6000
+const orderPushDismissTimers = new Map()
 /** @type {null|'income'|'expense'|'overall'} */
 let financeDetailPage = null
 const FINANCE_ACCOUNTS_ENABLED_KEY = 'dashboardFinanceAccountsEnabled'
@@ -274,6 +314,10 @@ function savedToastMessage() {
 }
 
 function showToast(message) {
+  if (window.BazarioAnim?.showToast) {
+    BazarioAnim.showToast(message, { success: !String(message).includes('Видалено') && !String(message).includes('Помилка') })
+    return
+  }
   const el = document.getElementById('toast')
   el.textContent = message
   el.hidden = false
@@ -304,10 +348,163 @@ function listAccountingOrderTransactions() {
   return db.list('orderTransactions').filter((tx) => shops.has(orderTransactionShopValue(tx)))
 }
 
+function orderNotificationStatusKey(tx) {
+  return orderTransactionActiveStatusLabel(tx) || ''
+}
+
+/** Повернути в сповіщення замовлення, приховані після перегляду, якщо статус змінився. */
+function restoreOrderNotificationsAfterStatusChange() {
+  const dismissed = getOrderNotificationDismissedIds()
+  if (!dismissed.length) return
+  const keep = dismissed.filter((id) => {
+    const tx = db.get('orderTransactions', id)
+    if (!tx || !orderTransactionShowInNotifications(tx)) return false
+    return !isOrderNotificationUnseen(tx)
+  })
+  if (keep.length !== dismissed.length) saveOrderNotificationDismissedIds(keep)
+}
+
+function getOrderNotificationSeenByStatus() {
+  const raw = db.getSettings()?.orderNotificationSeenByStatus
+  if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+    return { ...raw }
+  }
+  const legacyIds = db.getSettings()?.orderNotificationSeenIds
+  if (!Array.isArray(legacyIds) || !legacyIds.length) return {}
+  const map = {}
+  legacyIds.forEach((id) => {
+    if (!id) return
+    const tx = db.get('orderTransactions', id)
+    map[id] = tx ? orderNotificationStatusKey(tx) : ''
+  })
+  return map
+}
+
+function getOrderNotificationDismissedIds() {
+  const ids = db.getSettings()?.orderNotificationDismissedIds
+  return Array.isArray(ids) ? ids : []
+}
+
+function getOrderNotificationDismissedSet() {
+  return new Set(getOrderNotificationDismissedIds())
+}
+
+function saveOrderNotificationDismissedIds(ids) {
+  const unique = [...new Set(ids.filter(Boolean))]
+  db.write('settings', { ...db.getSettings(), orderNotificationDismissedIds: unique })
+}
+
+function dismissOrderNotification(txId) {
+  if (!txId) return
+  const ids = getOrderNotificationDismissedIds()
+  if (ids.includes(txId)) return
+  saveOrderNotificationDismissedIds([...ids, txId])
+}
+
+function pruneOrderNotificationDismissedIds() {
+  const dismissed = getOrderNotificationDismissedIds()
+  const pruned = dismissed.filter((id) => {
+    const tx = db.get('orderTransactions', id)
+    return tx && orderTransactionShowInNotifications(tx)
+  })
+  if (pruned.length !== dismissed.length) saveOrderNotificationDismissedIds(pruned)
+}
+
+function getVisibleOrderNotifications() {
+  const dismissed = getOrderNotificationDismissedSet()
+  return getOrderNotifications().filter((tx) => !dismissed.has(tx.id))
+}
+
+function isOrderNotificationSeen(tx) {
+  return Boolean(tx?.id && !isOrderNotificationUnseen(tx))
+}
+
+function getViewedOrderNotifications() {
+  const dismissed = getOrderNotificationDismissedSet()
+  return getOrderNotifications().filter((tx) => isOrderNotificationSeen(tx) && !dismissed.has(tx.id))
+}
+
+function clearViewedOrderNotifications() {
+  const dismissed = new Set(getOrderNotificationDismissedIds())
+  getViewedOrderNotifications().forEach((tx) => dismissed.add(tx.id))
+  saveOrderNotificationDismissedIds([...dismissed])
+  syncNotificationsUI()
+  showToast('Переглянуті сповіщення видалено')
+}
+
+function saveOrderNotificationSeenByStatus(map) {
+  const cleaned = {}
+  Object.entries(map || {}).forEach(([id, status]) => {
+    if (id && status != null && String(status) !== '') cleaned[id] = String(status)
+  })
+  db.write('settings', {
+    ...db.getSettings(),
+    orderNotificationSeenByStatus: cleaned,
+    orderNotificationSeenIds: [],
+  })
+}
+
+function pruneOrderNotificationSeenIds() {
+  const seen = getOrderNotificationSeenByStatus()
+  const pruned = {}
+  Object.entries(seen).forEach(([id, status]) => {
+    const tx = db.get('orderTransactions', id)
+    if (tx && orderTransactionShowInNotifications(tx)) pruned[id] = status
+  })
+  if (Object.keys(pruned).length !== Object.keys(seen).length) saveOrderNotificationSeenByStatus(pruned)
+}
+
+function markOrderNotificationSeen(txId) {
+  if (!txId) return
+  const tx = db.get('orderTransactions', txId)
+  if (!tx) return
+  const statusKey = orderNotificationStatusKey(tx)
+  const seen = getOrderNotificationSeenByStatus()
+  if (seen[txId] === statusKey) return
+  saveOrderNotificationSeenByStatus({ ...seen, [txId]: statusKey })
+  const dismissed = getOrderNotificationDismissedIds()
+  if (dismissed.includes(txId)) {
+    saveOrderNotificationDismissedIds(dismissed.filter((id) => id !== txId))
+  }
+}
+
+function isOrderNotificationUnseen(tx) {
+  if (!tx?.id) return false
+  const seenStatus = getOrderNotificationSeenByStatus()[tx.id]
+  if (seenStatus == null || seenStatus === '') return true
+  return orderNotificationStatusKey(tx) !== seenStatus
+}
+
+function parseOrderLocalDateKey(raw) {
+  if (!raw) return null
+  const str = String(raw).trim()
+  if (/^\d{4}-\d{2}-\d{2}$/.test(str)) return str
+
+  const isIsoWithZone = /[Zz]$/.test(str) || /[+-]\d{2}:\d{2}$/.test(str)
+  if (!isIsoWithZone) {
+    const localPrefix = str.match(/^(\d{4}-\d{2}-\d{2})[ T]\d{2}:\d{2}/)
+    if (localPrefix) return localPrefix[1]
+  }
+
+  const d = new Date(str)
+  if (Number.isNaN(d.getTime())) return null
+  return getLocalDateInputValue(d)
+}
+
+function orderTransactionLocalDateKey(tx) {
+  if (tx?.dateLocal) return String(tx.dateLocal).trim().slice(0, 10) || null
+  return parseOrderLocalDateKey(tx?.date || tx?.createdAt)
+}
+
 function getOrderNotifications() {
   return listAccountingOrderTransactions()
     .filter(orderTransactionShowInNotifications)
-    .sort((a, b) => new Date(b.updatedAt || b.createdAt || 0) - new Date(a.updatedAt || a.createdAt || 0))
+    .sort((a, b) => {
+      const unseenA = isOrderNotificationUnseen(a) ? 1 : 0
+      const unseenB = isOrderNotificationUnseen(b) ? 1 : 0
+      if (unseenA !== unseenB) return unseenB - unseenA
+      return new Date(b.updatedAt || b.createdAt || 0) - new Date(a.updatedAt || a.createdAt || 0)
+    })
 }
 
 function getAccountingSubPageForShop(shop) {
@@ -322,9 +519,242 @@ function orderNotificationTitle(tx) {
   return client || product || '—'
 }
 
+function getUnseenOrderNotificationsCount() {
+  return getVisibleOrderNotifications().filter(isOrderNotificationUnseen).length
+}
+
+function getTelegramSettingsBlock() {
+  const raw = db.getSettings()?.telegram
+  return raw && typeof raw === 'object' ? raw : {}
+}
+
+function saveTelegramSettingsBlock(patch) {
+  db.write('settings', {
+    ...db.getSettings(),
+    telegram: { ...getTelegramSettingsBlock(), ...patch },
+  })
+}
+
+function getTelegramNotificationSeenSet() {
+  const ids = getTelegramSettingsBlock().seenIds
+  return new Set(Array.isArray(ids) ? ids : [])
+}
+
+function getTelegramNotificationDismissedSet() {
+  const ids = getTelegramSettingsBlock().dismissedIds
+  return new Set(Array.isArray(ids) ? ids : [])
+}
+
+function getTelegramNotifications() {
+  const list = Array.isArray(getTelegramSettingsBlock().messages) ? getTelegramSettingsBlock().messages : []
+  return [...list].sort((a, b) => new Date(b.date || 0) - new Date(a.date || 0))
+}
+
+function getVisibleTelegramNotifications() {
+  const dismissed = getTelegramNotificationDismissedSet()
+  return getTelegramNotifications().filter((msg) => !dismissed.has(msg.id))
+}
+
+function isTelegramNotificationUnseen(msg) {
+  return Boolean(msg?.id && !getTelegramNotificationSeenSet().has(msg.id))
+}
+
+function markTelegramNotificationSeen(msgId) {
+  if (!msgId) return
+  const seen = [...getTelegramNotificationSeenSet()]
+  if (seen.includes(msgId)) return
+  saveTelegramSettingsBlock({ seenIds: [...seen, msgId] })
+}
+
+function dismissTelegramNotification(msgId) {
+  if (!msgId) return
+  const ids = [...getTelegramNotificationDismissedSet()]
+  if (ids.includes(msgId)) return
+  saveTelegramSettingsBlock({ dismissedIds: [...ids, msgId] })
+}
+
+function getUnseenTelegramNotificationsCount() {
+  if (!window.BazarioTelegramSync?.isEnabled?.()) return 0
+  return getVisibleTelegramNotifications().filter(isTelegramNotificationUnseen).length
+}
+
+function telegramNotificationTitle(msg) {
+  const name = String(msg?.fromName || '').trim()
+  const chat = String(msg?.chatTitle || '').trim()
+  if (name && chat && name !== chat) return `${name} · ${chat}`
+  return name || chat || 'Telegram'
+}
+
+function telegramMessageOpenUrl(msg) {
+  const chatId = String(msg?.chatId ?? '')
+  const messageId = msg?.messageId
+  if (!chatId || messageId == null) return null
+  if (chatId.startsWith('-100')) {
+    return `https://t.me/c/${chatId.slice(4)}/${messageId}`
+  }
+  if (msg?.username) return `https://t.me/${msg.username}`
+  return null
+}
+
+function telegramNotificationItem(msg) {
+  const unseen = isTelegramNotificationUnseen(msg)
+  const seen = !unseen
+  const preview = String(msg?.text || '—').trim()
+  const short = preview.length > 120 ? `${preview.slice(0, 117)}…` : preview
+  return `
+    <li class="notifications-list-item${seen ? ' is-seen' : ''}">
+      <button type="button" class="notifications-item notifications-item--telegram${unseen ? ' is-new' : ''}" data-telegram-notify="${escapeHtml(msg.id)}">
+        <span class="notifications-item-title">${escapeHtml(telegramNotificationTitle(msg))}</span>
+        <span class="notifications-item-meta notifications-item-meta--telegram">
+          <span class="notifications-telegram-badge">Telegram</span>
+          <span class="notifications-item-meta-text">${escapeHtml(short)}</span>
+        </span>
+        <span class="notifications-item-time">${escapeHtml(formatTaskDateTime(msg.date))}</span>
+      </button>
+      ${seen ? `<button type="button" class="notifications-item-dismiss" data-dismiss-telegram-notify="${escapeHtml(msg.id)}" aria-label="Видалити сповіщення">×</button>` : ''}
+    </li>`
+}
+
+function collectNewTaskNotificationPushes() {
+  const { newTasks, activeTasks } = getTaskNotificationBuckets()
+  const tasks = [...newTasks, ...activeTasks]
+  const currentIds = new Set(tasks.map((t) => t.id))
+  if (taskNotificationPushSnapshot === null) {
+    taskNotificationPushSnapshot = currentIds
+    return []
+  }
+  const fresh = tasks.filter((t) => !taskNotificationPushSnapshot.has(t.id))
+  taskNotificationPushSnapshot = currentIds
+  return fresh
+}
+
+function collectNewTelegramNotificationPushes() {
+  if (!window.BazarioTelegramSync?.isEnabled?.()) return []
+  const unseen = getVisibleTelegramNotifications().filter(isTelegramNotificationUnseen)
+  const currentIds = new Set(unseen.map((m) => m.id))
+  if (telegramNotificationPushSnapshot === null) {
+    telegramNotificationPushSnapshot = currentIds
+    return []
+  }
+  const fresh = unseen.filter((m) => !telegramNotificationPushSnapshot.has(m.id))
+  telegramNotificationPushSnapshot = currentIds
+  return fresh
+}
+
+function renderTelegramPushNotificationEl(msg) {
+  const el = document.createElement('div')
+  el.className = 'order-push order-push--telegram'
+  el.dataset.orderPushKey = `tg:${msg.id}`
+  const preview = String(msg?.text || '—').trim()
+  const short = preview.length > 100 ? `${preview.slice(0, 97)}…` : preview
+  el.innerHTML = `
+    <div class="order-push-head">
+      <span class="order-push-kicker">Telegram</span>
+      <button type="button" class="order-push-close" data-order-push-close aria-label="Закрити">×</button>
+    </div>
+    <button type="button" class="order-push-main" data-telegram-push-open="${escapeHtml(msg.id)}">
+      <span class="order-push-title">${escapeHtml(telegramNotificationTitle(msg))}</span>
+      <span class="order-push-meta">
+        <span class="notifications-telegram-badge">Чат</span>
+        <span class="order-push-meta-text">${escapeHtml(short)}</span>
+      </span>
+    </button>`
+  return el
+}
+
+function showTelegramPushNotification(msg) {
+  if (!msg?.id) return
+  const stack = document.getElementById('orderPushStack')
+  if (!stack) return
+  const key = `tg:${msg.id}`
+  const existing = [...stack.querySelectorAll('.order-push')].find((node) => node.dataset.orderPushKey === key)
+  if (existing) dismissOrderPushNotification(existing, { immediate: true })
+  const el = renderTelegramPushNotificationEl(msg)
+  stack.prepend(el)
+  trimOrderPushStack(stack)
+  window.BazarioAnim?.animateOrderPushIn?.(el)
+  window.BazarioAnim?.playNotificationSound?.()
+  const timer = setTimeout(() => dismissOrderPushNotification(el), ORDER_PUSH_AUTO_DISMISS_MS)
+  orderPushDismissTimers.set(key, timer)
+  notifyDevice({
+    tag: key,
+    title: telegramNotificationTitle(msg),
+    body: String(msg?.text || '—').trim().slice(0, 180),
+    data: { kind: 'telegram', id: msg.id },
+  })
+}
+
+function closeTelegramMessageModal() {
+  const modal = document.getElementById('telegramMessageModal')
+  hideAppModal(modal)
+  const openTgBtn = document.getElementById('telegramMessageModalOpenTg')
+  if (openTgBtn) {
+    openTgBtn.hidden = true
+    delete openTgBtn.dataset.url
+  }
+}
+
+function openTelegramNotification(msgId) {
+  const msg = getTelegramNotifications().find((m) => m.id === msgId)
+  if (!msg) return
+  markTelegramNotificationSeen(msgId)
+  closeNotificationsPanel()
+
+  const modal = document.getElementById('telegramMessageModal')
+  const titleEl = document.getElementById('telegramMessageModalTitle')
+  const metaEl = document.getElementById('telegramMessageModalMeta')
+  const textEl = document.getElementById('telegramMessageModalText')
+  const openTgBtn = document.getElementById('telegramMessageModalOpenTg')
+  if (!modal || !titleEl || !metaEl || !textEl) {
+    showToast(msg.text || '—')
+    syncNotificationsUI()
+    return
+  }
+
+  const chatTitle = String(msg.chatTitle || '').trim()
+  const fromName = String(msg.fromName || '').trim()
+  titleEl.textContent = chatTitle || fromName || 'Telegram'
+
+  const metaParts = []
+  if (chatTitle && fromName && fromName !== chatTitle) metaParts.push(fromName)
+  const dateLabel = formatTaskDateTime(msg.date)
+  if (dateLabel) metaParts.push(dateLabel)
+  metaEl.textContent = metaParts.join(' · ') || '—'
+
+  textEl.textContent = String(msg.text || '—').trim() || '—'
+
+  const url = telegramMessageOpenUrl(msg)
+  if (openTgBtn) {
+    if (url) {
+      openTgBtn.hidden = false
+      openTgBtn.dataset.url = url
+    } else {
+      openTgBtn.hidden = true
+      delete openTgBtn.dataset.url
+    }
+  }
+
+  showAppModal(modal)
+  syncNotificationsUI()
+  requestAnimationFrame(() => document.getElementById('telegramMessageModalOk')?.focus())
+}
+
+function applyTelegramSyncResult(result, { silent = false } = {}) {
+  if (!result || result.skipped) return
+  const hasNew = (result.added || 0) > 0 || (result.changed?.length || 0) > 0
+  if (!hasNew) return
+  syncNotificationsUI()
+  if (!silent && result.added > 0) {
+    showToast(`Telegram: ${result.added} ${result.added === 1 ? 'нове повідомлення' : 'нових повідомлень'}`)
+  }
+}
+
 function getNotificationsBadgeCount() {
   const { newTasks, activeTasks } = getTaskNotificationBuckets()
-  return getOrderNotifications().length + newTasks.length + activeTasks.length
+  return getUnseenOrderNotificationsCount()
+    + getUnseenTelegramNotificationsCount()
+    + newTasks.length
+    + activeTasks.length
 }
 
 function taskNotificationItem(task, { isNew = false } = {}) {
@@ -338,12 +768,118 @@ function taskNotificationItem(task, { isNew = false } = {}) {
     </li>`
 }
 
+function orderNotificationPushKey(tx) {
+  return `${tx.id}:${orderNotificationStatusKey(tx)}`
+}
+
+function buildOrderNotificationStatusSnapshot() {
+  const map = new Map()
+  listAccountingOrderTransactions().forEach((tx) => {
+    if (!tx?.id) return
+    map.set(tx.id, orderNotificationStatusKey(tx))
+  })
+  return map
+}
+
+/** Будь-яка зміна статусу (нове замовлення або інший label), незалежно від «переглянуто». */
+function collectNewOrderNotificationPushes() {
+  const orders = listAccountingOrderTransactions()
+  const next = buildOrderNotificationStatusSnapshot()
+  if (orderNotificationStatusSnapshot === null) {
+    orderNotificationStatusSnapshot = next
+    return []
+  }
+  const fresh = orders.filter((tx) => {
+    const cur = orderNotificationStatusKey(tx)
+    const prev = orderNotificationStatusSnapshot.get(tx.id)
+    return prev === undefined || prev !== cur
+  })
+  orderNotificationStatusSnapshot = next
+  return fresh
+}
+
+function orderPushNotificationKicker(tx) {
+  const status = orderTransactionStatusValue(tx)
+  return status === 'Нове Замовлення' ? 'Нове замовлення' : 'Оновлення статусу'
+}
+
+function renderOrderPushNotificationEl(tx) {
+  const status = orderTransactionStatusValue(tx)
+  const el = document.createElement('div')
+  el.className = 'order-push'
+  el.dataset.orderPushKey = orderNotificationPushKey(tx)
+  el.innerHTML = `
+    <div class="order-push-head">
+      <span class="order-push-kicker">${escapeHtml(orderPushNotificationKicker(tx))}</span>
+      <button type="button" class="order-push-close" data-order-push-close aria-label="Закрити">×</button>
+    </div>
+    <button type="button" class="order-push-main" data-order-push-open="${escapeHtml(tx.id)}">
+      <span class="order-push-title">${escapeHtml(orderNotificationTitle(tx))}</span>
+      <span class="order-push-meta">
+        ${renderOrderTransactionStatusBadge(status, { extraClass: 'order-push-status' })}
+        <span class="order-push-meta-text">${escapeHtml(orderTransactionShopValue(tx))} · ${escapeHtml(fmtMoney(orderTransactionAmountValue(tx)))}</span>
+      </span>
+    </button>`
+  return el
+}
+
+function trimOrderPushStack(stack) {
+  const items = [...stack.querySelectorAll('.order-push')]
+  while (items.length > ORDER_PUSH_MAX_VISIBLE) {
+    const oldest = items.shift()
+    if (oldest) dismissOrderPushNotification(oldest, { immediate: true })
+  }
+}
+
+function dismissOrderPushNotification(el, { immediate = false } = {}) {
+  if (!el) return
+  const key = el.dataset.orderPushKey
+  if (key && orderPushDismissTimers.has(key)) {
+    clearTimeout(orderPushDismissTimers.get(key))
+    orderPushDismissTimers.delete(key)
+  }
+  if (immediate || window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+    el.remove()
+    return
+  }
+  el.classList.add('order-push--exit')
+  el.addEventListener('animationend', () => el.remove(), { once: true })
+}
+
+function showOrderPushNotification(tx) {
+  if (!tx?.id) return
+  const stack = document.getElementById('orderPushStack')
+  if (!stack) return
+  const key = orderNotificationPushKey(tx)
+  const existing = [...stack.querySelectorAll('.order-push')].find((node) => node.dataset.orderPushKey === key)
+  if (existing) {
+    dismissOrderPushNotification(existing, { immediate: true })
+  }
+  const el = renderOrderPushNotificationEl(tx)
+  stack.prepend(el)
+  trimOrderPushStack(stack)
+  window.BazarioAnim?.animateOrderPushIn?.(el)
+  window.BazarioAnim?.playNotificationSound?.()
+  const timer = setTimeout(() => dismissOrderPushNotification(el), ORDER_PUSH_AUTO_DISMISS_MS)
+  orderPushDismissTimers.set(key, timer)
+  notifyDevice({
+    tag: key,
+    title: orderNotificationTitle(tx),
+    body: `${orderTransactionShopValue(tx)} · ${orderTransactionStatusValue(tx)} · ${fmtMoney(orderTransactionAmountValue(tx))}`,
+    data: { kind: 'order', id: tx.id },
+  })
+}
+
+function notifyDevice(payload) {
+  window.BazarioDeviceNotifications?.notify?.(payload)
+}
+
 function orderNotificationItem(tx) {
   const status = orderTransactionStatusValue(tx)
-  const isNew = status === 'Нове Замовлення'
+  const unseen = isOrderNotificationUnseen(tx)
   return `
-    <li>
-      <button type="button" class="notifications-item notifications-item--order${isNew ? ' is-new' : ''}" data-order-notify="${tx.id}">
+    <li class="notifications-list-item${unseen ? '' : ' is-seen'}">
+      <button type="button" class="notifications-item notifications-item--order${unseen ? ' is-new' : ''}" data-order-notify="${tx.id}">
         <span class="notifications-item-title">${escapeHtml(orderNotificationTitle(tx))}</span>
         <span class="notifications-item-meta notifications-item-meta--order">
           ${renderOrderTransactionStatusBadge(status, { extraClass: 'notifications-order-status' })}
@@ -354,9 +890,59 @@ function orderNotificationItem(tx) {
     </li>`
 }
 
+function renderDeviceNotificationsBanner() {
+  const dn = window.BazarioDeviceNotifications
+  if (!dn?.supported?.()) return ''
+  const perm = dn.permission()
+  if (perm === 'granted') return ''
+  const label = perm === 'denied'
+    ? 'Сповіщення вимкнені. macOS: Системні налаштування → Сповіщення → Chrome/Safari → дозволити для localhost.'
+    : 'Увімкнути сповіщення на Mac (Telegram, замовлення, задачі)'
+  return `<div class="notifications-device-banner">
+    <button type="button" class="notifications-device-banner-btn" id="enableDeviceNotificationsBtn"${perm === 'denied' ? ' disabled' : ''}>${escapeHtml(label)}</button>
+  </div>`
+}
+
+async function refreshTelegramUserServerStatus() {
+  if (window.BazarioTelegramSync?.syncMode?.() !== 'user') return
+  try {
+    const basePath = String(window.BAZARIO_TELEGRAM?.userApiBase || '/api/telegram-user').replace(/\/$/, '')
+    const base = window.BazarioApiBase?.resolve?.(basePath) || basePath
+    const res = await fetch(`${base}/status`, {
+      headers: window.BazarioApiBase?.headers?.({ Accept: 'application/json' }) || { Accept: 'application/json' },
+    })
+    telegramUserServerStatus = await res.json().catch(() => ({ ok: false }))
+  } catch {
+    telegramUserServerStatus = { ok: false, lastError: 'server_unreachable' }
+  }
+  if (notificationsOpen) syncNotificationsUI()
+}
+
+function renderTelegramSetupHint() {
+  if (window.BazarioTelegramSync?.syncMode?.() !== 'user') return ''
+  const st = telegramUserServerStatus
+  const lines = []
+  if (!st) {
+    lines.push('Перевірка підключення до сервера…')
+  } else if (st.lastError === 'server_unreachable' || st.ok === false) {
+    lines.push('Запустіть ./start.sh і відкрийте http://localhost:8080 (не file://)')
+  } else if (!st.authorized) {
+    lines.push('Авторизація: node tools/telegram-user-auth.mjs')
+  } else {
+    lines.push('Напишіть нове повідомлення в групу (старі не синхронізуються)')
+    lines.push('Перевірте chatIds у telegram-user.local.json')
+    if ((st.bufferedMessages || 0) > 0) {
+      lines.push(`На сервері ${st.bufferedMessages} повідомлень — вони зʼявляться після синхронізації`)
+    }
+  }
+  return `<ul class="notifications-telegram-hint">${lines.map((line) => `<li>${escapeHtml(line)}</li>`).join('')}</ul>`
+}
+
 function renderNotificationsPanelContent() {
   const { newTasks, activeTasks } = getTaskNotificationBuckets()
-  const orders = getOrderNotifications()
+  const orders = getVisibleOrderNotifications()
+  const newOrders = orders.filter(isOrderNotificationUnseen)
+  const viewedOrders = orders.filter(isOrderNotificationSeen)
 
   const section = (title, bodyHtml) => `
     <section class="notifications-section">
@@ -371,11 +957,68 @@ function renderNotificationsPanelContent() {
     return section(title, body)
   }
 
+  const telegram = getVisibleTelegramNotifications()
+  const telegramEnabled = window.BazarioTelegramSync?.isEnabled?.()
+  const telegramMode = window.BazarioTelegramSync?.syncMode?.() || 'bot'
+  const telegramEmpty = telegramEnabled
+    ? (telegramMode === 'user'
+      ? 'Немає нових повідомлень з ваших груп'
+      : 'Немає повідомлень з обраних чатів')
+    : (telegramMode === 'user'
+      ? 'Увімкніть mode: "user" і налаштуйте telegram-user.local.json'
+      : 'Налаштуйте telegram-config.js (botToken і chatIds)')
+
+  const telegramSection = () => {
+    if (!telegramEnabled && !telegram.length) return ''
+    const body = telegram.length
+      ? `<ul class="notifications-list">${telegram.map(telegramNotificationItem).join('')}</ul>`
+      : `<p class="notifications-empty muted">${telegramEmpty}</p>${renderTelegramSetupHint()}`
+    return section('Telegram', body)
+  }
+
+  const orderSections = []
+  if (newOrders.length) {
+    orderSections.push(listSection('Замовлення · нові', newOrders, '', orderNotificationItem))
+  }
+  if (viewedOrders.length) {
+    orderSections.push(listSection('Замовлення · переглянуті', viewedOrders, '', orderNotificationItem))
+  }
+  if (!newOrders.length && !viewedOrders.length) {
+    orderSections.push(listSection('Замовлення', [], 'Немає замовлень', orderNotificationItem))
+  }
+
   return [
-    listSection('Замовлення', orders, 'Немає замовлень (окрім «Продаж» та «Розпродаж»)', orderNotificationItem),
+    renderDeviceNotificationsBanner(),
+    telegramSection(),
+    ...orderSections,
     listSection('Нові', newTasks, 'У вас немає задач «До виконання»', (t) => taskNotificationItem(t, { isNew: true })),
     listSection('Активні', activeTasks, 'У вас немає задач «В роботі»', (t) => taskNotificationItem(t, { isNew: false })),
   ].join('')
+}
+
+function syncNotificationsClearButton() {
+  const btn = document.getElementById('clearViewedNotificationsBtn')
+  if (!btn) return
+  const count = getViewedOrderNotifications().length
+  btn.hidden = count <= 0
+  btn.textContent = count > 0 ? `Видалити переглянуті (${count})` : 'Видалити переглянуті'
+}
+
+function primeNotificationPushSnapshots() {
+  orderNotificationStatusSnapshot = buildOrderNotificationStatusSnapshot()
+  telegramNotificationPushSnapshot = new Set(
+    getVisibleTelegramNotifications()
+      .filter(isTelegramNotificationUnseen)
+      .map((m) => m.id),
+  )
+  const { newTasks, activeTasks } = getTaskNotificationBuckets()
+  taskNotificationPushSnapshot = new Set([...newTasks, ...activeTasks].map((t) => t.id))
+}
+
+function playSoundForFreshNotifications(freshOrders, freshTelegram, freshTasks) {
+  if (freshTelegram.length || freshTasks.length) {
+    window.BazarioAnim?.playNotificationSound?.()
+  }
 }
 
 function syncNotificationsUI() {
@@ -385,19 +1028,46 @@ function syncNotificationsUI() {
   const btn = document.getElementById('notificationsBtn')
   if (!badge || !panel) return
 
+  restoreOrderNotificationsAfterStatusChange()
+
+  const freshOrders = collectNewOrderNotificationPushes()
+  const freshTelegram = collectNewTelegramNotificationPushes()
+  const freshTasks = collectNewTaskNotificationPushes()
+
   const count = getNotificationsBadgeCount()
   badge.hidden = count <= 0
   badge.textContent = count > 99 ? '99+' : String(count)
+  syncNotificationsClearButton()
 
   panel.classList.toggle('is-hidden', !notificationsOpen)
   if (btn) btn.setAttribute('aria-expanded', notificationsOpen ? 'true' : 'false')
   if (notificationsOpen && content) content.innerHTML = renderNotificationsPanelContent()
+  window.BazarioAnim?.onNotificationsUpdate(count)
+
+  freshOrders.forEach(showOrderPushNotification)
+  freshTelegram.forEach(showTelegramPushNotification)
+  freshTasks.forEach((task) => {
+    notifyDevice({
+      tag: `task:${task.id}`,
+      title: `Задача: ${task.title || '—'}`,
+      body: `${getTaskAssigneeDisplay(task)} · ${statusLabels[task.status] || '—'}`,
+      data: { kind: 'task', id: task.id },
+    })
+  })
+  playSoundForFreshNotifications(freshOrders, freshTelegram, freshTasks)
+}
+
+function dismissAllOrderPushNotifications() {
+  document.querySelectorAll('#orderPushStack .order-push').forEach((el) => {
+    dismissOrderPushNotification(el, { immediate: true })
+  })
 }
 
 function openNotificationsPanel() {
   notificationsOpen = true
-  const content = document.getElementById('notificationsContent')
-  if (content) content.innerHTML = renderNotificationsPanelContent()
+  dismissAllOrderPushNotifications()
+  primeNotificationPushSnapshots()
+  refreshTelegramUserServerStatus()
   syncNotificationsUI()
 }
 
@@ -411,6 +1081,19 @@ function toggleNotificationsPanel() {
   else openNotificationsPanel()
 }
 
+function initNotificationDateWatch() {
+  let dayKey = getLocalDateInputValue()
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState !== 'visible') return
+    const today = getLocalDateInputValue()
+    if (today === dayKey) return
+    dayKey = today
+    pruneOrderNotificationSeenIds()
+    pruneOrderNotificationDismissedIds()
+    syncNotificationsUI()
+  })
+}
+
 function goToTaskFromNotification(taskId) {
   closeNotificationsPanel()
   activeNav = 'tasks'
@@ -422,13 +1105,16 @@ function goToTaskFromNotification(taskId) {
     searchInput.placeholder = SEARCH_PLACEHOLDERS.tasks
   }
   renderNav({ animate: true })
+  window.BazarioAnim?.markPageTransition()
   render()
 }
 
-function goToOrderFromNotification(txId) {
+function goToOrderFromNotification(txId, { keepNotificationsPanel = false } = {}) {
   const tx = db.get('orderTransactions', txId)
   if (!tx) return
-  closeNotificationsPanel()
+  markOrderNotificationSeen(txId)
+  if (keepNotificationsPanel) syncNotificationsUI()
+  else closeNotificationsPanel()
   activeNav = 'accounting'
   accountingSubPage = getAccountingSubPageForShop(orderTransactionShopValue(tx))
   financeDetailPage = null
@@ -447,10 +1133,69 @@ function goToOrderFromNotification(txId) {
     searchInput.placeholder = 'Пошук транзакцій...'
   }
   renderNav({ animate: true })
+  window.BazarioAnim?.markPageTransition()
   render()
+  if (keepNotificationsPanel) syncNotificationsUI()
   requestAnimationFrame(() => {
     document.querySelector(`.bazario-order-row[data-order-tx-id="${tx.id}"]`)
       ?.scrollIntoView({ block: 'nearest', behavior: 'smooth' })
+  })
+}
+
+function initOrderPushNotifications() {
+  const stack = document.getElementById('orderPushStack')
+  if (!stack || stack.dataset.bound === '1') return
+  stack.dataset.bound = '1'
+
+  stack.addEventListener('click', (e) => {
+    const closeBtn = e.target.closest('[data-order-push-close]')
+    if (closeBtn) {
+      e.preventDefault()
+      e.stopPropagation()
+      dismissOrderPushNotification(closeBtn.closest('.order-push'))
+      return
+    }
+    const openBtn = e.target.closest('[data-order-push-open]')
+    if (openBtn) {
+      e.preventDefault()
+      e.stopPropagation()
+      const push = openBtn.closest('.order-push')
+      dismissOrderPushNotification(push, { immediate: true })
+      markOrderNotificationSeen(openBtn.dataset.orderPushOpen)
+      goToOrderFromNotification(openBtn.dataset.orderPushOpen)
+      return
+    }
+    const tgOpenBtn = e.target.closest('[data-telegram-push-open]')
+    if (tgOpenBtn) {
+      e.preventDefault()
+      e.stopPropagation()
+      const push = tgOpenBtn.closest('.order-push')
+      dismissOrderPushNotification(push, { immediate: true })
+      openTelegramNotification(tgOpenBtn.dataset.telegramPushOpen)
+    }
+  })
+}
+
+function initTelegramMessageModal() {
+  const modal = document.getElementById('telegramMessageModal')
+  if (!modal || modal.dataset.bound === '1') return
+  modal.dataset.bound = '1'
+
+  const close = () => closeTelegramMessageModal()
+
+  document.getElementById('telegramMessageModalClose')?.addEventListener('click', close)
+  document.getElementById('telegramMessageModalOk')?.addEventListener('click', close)
+  document.getElementById('telegramMessageModalOpenTg')?.addEventListener('click', (e) => {
+    const url = e.currentTarget?.dataset?.url
+    if (url) window.open(url, '_blank', 'noopener,noreferrer')
+  })
+  modal.addEventListener('click', (e) => {
+    if (e.target === modal) close()
+  })
+  document.addEventListener('keydown', (e) => {
+    if (e.key !== 'Escape') return
+    if (modal.classList.contains('is-hidden')) return
+    close()
   })
 }
 
@@ -458,17 +1203,52 @@ function initNotifications() {
   const wrap = document.querySelector('.notifications-wrap')
   if (!wrap || wrap.dataset.bound === '1') return
   wrap.dataset.bound = '1'
+  initTelegramMessageModal()
+  initOrderPushNotifications()
 
   wrap.addEventListener('click', (e) => {
+    if (e.target.closest('#enableDeviceNotificationsBtn')) {
+      e.preventDefault()
+      e.stopPropagation()
+      window.BazarioDeviceNotifications?.ensurePermission?.({ prompt: true }).then((ok) => {
+        if (ok) {
+          showToast('Сповіщення на пристрої увімкнено')
+          window.BazarioDeviceNotifications?.notifyTest?.()
+        } else showToast('Дозвіл на сповіщення не надано')
+        syncNotificationsUI()
+      })
+      return
+    }
+    if (e.target.closest('#clearViewedNotificationsBtn')) {
+      e.preventDefault()
+      e.stopPropagation()
+      clearViewedOrderNotifications()
+      return
+    }
     if (e.target.closest('#notificationsBtn')) {
       e.stopPropagation()
+      window.BazarioDeviceNotifications?.ensurePermission?.({ prompt: false })
       toggleNotificationsPanel()
       return
     }
     const orderItem = e.target.closest('[data-order-notify]')
     if (orderItem) {
       e.preventDefault()
-      goToOrderFromNotification(orderItem.dataset.orderNotify)
+      goToOrderFromNotification(orderItem.dataset.orderNotify, { keepNotificationsPanel: true })
+      return
+    }
+    const tgDismiss = e.target.closest('[data-dismiss-telegram-notify]')
+    if (tgDismiss) {
+      e.preventDefault()
+      e.stopPropagation()
+      dismissTelegramNotification(tgDismiss.dataset.dismissTelegramNotify)
+      syncNotificationsUI()
+      return
+    }
+    const tgItem = e.target.closest('[data-telegram-notify]')
+    if (tgItem) {
+      e.preventDefault()
+      openTelegramNotification(tgItem.dataset.telegramNotify)
       return
     }
     const item = e.target.closest('[data-task-notify]')
@@ -512,6 +1292,7 @@ function initHomeTaskLinks() {
         searchInput.placeholder = SEARCH_PLACEHOLDERS.tasks
       }
       renderNav({ animate: true })
+      window.BazarioAnim?.markPageTransition()
       render()
     }
   })
@@ -1076,6 +1857,41 @@ function renderSelectOptions(values, selected = '') {
     .join('')
 }
 
+function getRozetkaOrderStatusPickerLabels() {
+  return window.BazarioRozetkaSync?.getStatusPickerLabels?.() || []
+}
+
+function getBazarioOrderStatusGroups(current = '') {
+  const crm = [...bazarioOrderStatuses]
+  const crmKeys = new Set(crm.map((s) => normalizeOrderStatusKey(s)))
+  const rozetka = getRozetkaOrderStatusPickerLabels().filter(
+    (s) => !crmKeys.has(normalizeOrderStatusKey(s)),
+  )
+  const cur = String(current || '').trim()
+  if (cur && !crm.includes(cur) && !rozetka.includes(cur)) {
+    rozetka.unshift(cur)
+  }
+  return { crm, rozetka }
+}
+
+function renderBazarioOrderStatusSelectOptions(selected = '') {
+  const { crm, rozetka } = getBazarioOrderStatusGroups(selected)
+  const cur = String(selected || '')
+  const option = (value) => (
+    `<option value="${escapeHtml(value)}"${value === cur ? ' selected' : ''}>${escapeHtml(value)}</option>`
+  )
+  let html = `<optgroup label="CRM">${crm.map(option).join('')}</optgroup>`
+  if (rozetka.length) {
+    html += `<optgroup label="Rozetka">${rozetka.map(option).join('')}</optgroup>`
+  }
+  return html
+}
+
+function orderTransactionEffectiveCrmStatus(tx) {
+  const raw = orderTransactionStatusValue(tx)
+  return window.BazarioRozetkaSync?.mapStatusToCrm?.(raw) ?? raw
+}
+
 function profileDisplayName(p) {
   return `${p.lastName || ''} ${p.firstName || ''}`.trim() || p.email || '—'
 }
@@ -1631,7 +2447,7 @@ function stockCard(stats) {
           <p class="stock-value">${escapeHtml(totalMoney)}</p>
         </div>
         <div class="stock-value-row stock-value-row--share">
-          <span class="stock-value-label">Моя доля</span>
+          <span class="stock-value-label">Моя частка</span>
           <p class="stock-value stock-value--share">${escapeHtml(shareMoney)}</p>
         </div>
         <span class="hint-text">${inventory.productsWithStock} товарів з залишком · усі місяці</span>
@@ -1741,27 +2557,208 @@ function tasksPreviewCard() {
   return card('Задачі', body)
 }
 
+function orderTransactionApiGrossFromDetails(tx) {
+  const details = tx?.rozetkaOrderDetails?.amounts
+  if (details && typeof details === 'object') {
+    const fromDetails = Number(details.amountWithDiscount ?? details.amount)
+    if (Number.isFinite(fromDetails) && fromDetails > 0) return fromDetails
+  }
+  return null
+}
+
+function orderTransactionStoredGrossAmount(tx) {
+  const fromDetails = orderTransactionApiGrossFromDetails(tx)
+  if (fromDetails != null) return fromDetails
+  const stored = Number(tx?.amount)
+  if (Number.isFinite(stored) && stored > 0) return stored
+  const parsed = parseAmountInput(tx?.amountDisplay)
+  if (parsed != null && parsed > 0) return parsed
+  return null
+}
+
+function orderTransactionApiUnitPriceForItem(item) {
+  const price = Number(item?.price)
+  if (Number.isFinite(price) && price > 0) return price
+  return null
+}
+
+function orderTransactionItems(tx) {
+  const fromDetails = tx?.rozetkaOrderDetails?.items
+  if (Array.isArray(fromDetails) && fromDetails.length) {
+    return fromDetails.filter((item) => item?.name)
+  }
+  const name = orderTransactionProductName(tx)
+  if (!name) return []
+  return [{
+    name,
+    article: tx?.article || '',
+    quantity: orderTransactionQtyValue(tx),
+    price: orderTransactionStoredUnitPrice(tx) ?? 0,
+    cancelled: orderTransactionIsCancelledByBuyer(tx),
+  }]
+}
+
+function orderTransactionActiveItems(tx) {
+  const items = orderTransactionItems(tx)
+  const active = items.filter((item) => !rozetkaOrderItemIsCancelled(item, tx))
+  return active.length ? active : items
+}
+
+function buildUkraineProductLookupMaps() {
+  const bySkuKey = new Map()
+  const byName = new Map()
+  listProductsForUkraineTable().forEach((product) => {
+    productUkraineSkuMatchKeys(product).forEach((key) => {
+      if (!bySkuKey.has(key)) bySkuKey.set(key, product)
+    })
+    const name = productDisplayName(product).toLowerCase()
+    if (name && !byName.has(name)) byName.set(name, product)
+  })
+  return { bySkuKey, byName }
+}
+
+function findUkraineProductForOrderItem(item, lookup = null) {
+  if (!item) return null
+  const maps = lookup || buildUkraineProductLookupMaps()
+  const article = orderTransactionArticleSku(item.article)
+  if (article) {
+    const match = maps.bySkuKey.get(productSkuKey(article)) || findUkraineProductByAnySku(article)
+    if (match) return match
+  }
+  const name = String(item.name || '').trim().toLowerCase()
+  if (name) return maps.byName.get(name) || null
+  return null
+}
+
+function orderTransactionItemForProduct(tx, product) {
+  if (!tx || !product?.id) return null
+  const lookup = buildUkraineProductLookupMaps()
+  const items = orderTransactionItems(tx)
+  for (const item of items) {
+    const matched = findUkraineProductForOrderItem(item, lookup)
+    if (matched?.id === product.id) return item
+  }
+  if (items.length === 1) {
+    const matched = findUkraineProductForOrderTransaction(tx)
+    if (matched?.id === product.id) return items[0]
+  }
+  return null
+}
+
+function orderTransactionQtyForProduct(tx, product = null) {
+  if (!product) return orderTransactionQtyValue(tx)
+  const item = orderTransactionItemForProduct(tx, product)
+  if (!item || rozetkaOrderItemIsCancelled(item, tx)) return 0
+  return Math.max(1, Number(item.quantity) || 1)
+}
+
+function orderTransactionApiUnitPrice(tx, product = null) {
+  if (product) {
+    const item = orderTransactionItemForProduct(tx, product)
+    return item ? orderTransactionApiUnitPriceForItem(item) : null
+  }
+  const items = orderTransactionActiveItems(tx)
+  if (items.length === 1) {
+    const fromItem = orderTransactionApiUnitPriceForItem(items[0])
+    if (fromItem != null) return fromItem
+  }
+  if (items.length > 1) return null
+  const gross = orderTransactionApiGrossFromDetails(tx) ?? orderTransactionStoredGrossAmount(tx)
+  const qty = orderTransactionQtyValue(tx)
+  if (gross != null && qty > 0) return gross / qty
+  return orderTransactionStoredUnitPrice(tx)
+}
+
+function orderTransactionApiLineTotalForItem(item, tx) {
+  const unit = orderTransactionApiUnitPriceForItem(item)
+  if (unit == null) return null
+  const qty = Math.max(1, Number(item?.quantity) || 1)
+  return unit * qty
+}
+
+function orderTransactionApiLineTotal(tx, product = null) {
+  if (product) {
+    const item = orderTransactionItemForProduct(tx, product)
+    return item ? orderTransactionApiLineTotalForItem(item, tx) : null
+  }
+  const items = orderTransactionActiveItems(tx)
+  if (items.length > 1) {
+    let sum = 0
+    let hasValue = false
+    items.forEach((item) => {
+      const line = orderTransactionApiLineTotalForItem(item, tx)
+      if (line != null) {
+        sum += line
+        hasValue = true
+      }
+    })
+    if (hasValue) return sum
+  }
+  if (items.length === 1) {
+    const line = orderTransactionApiLineTotalForItem(items[0], tx)
+    if (line != null) return line
+  }
+  const fromDetails = orderTransactionApiGrossFromDetails(tx)
+  if (fromDetails != null) return fromDetails
+  const stored = orderTransactionStoredGrossAmount(tx)
+  if (stored != null) return stored
+  const unit = orderTransactionApiUnitPrice(tx)
+  if (unit != null && unit > 0) return orderTransactionQtyValue(tx) * unit
+  return null
+}
+
+function orderTransactionCatalogLineTotalForItem(item, tx) {
+  const product = findUkraineProductForOrderItem(item)
+  if (!product) return 0
+  const shop = orderTransactionShopValue(tx)
+  const unit = ukraineProductCatalogPrice(product, { article: item?.article, shop })
+  if (unit <= 0) return 0
+  const qty = Math.max(1, Number(item?.quantity) || 1)
+  return unit * qty
+}
+
+function orderTransactionCatalogLineTotal(tx, product = null) {
+  if (product) {
+    const qty = orderTransactionQtyForProduct(tx, product)
+    const unit = orderTransactionUnitPriceFromCatalog(tx, product)
+    return qty * unit
+  }
+  const items = orderTransactionActiveItems(tx)
+  if (items.length > 1) {
+    return items.reduce((sum, item) => {
+      if (rozetkaOrderItemIsCancelled(item, tx)) return sum
+      return sum + orderTransactionCatalogLineTotalForItem(item, tx)
+    }, 0)
+  }
+  const unit = orderTransactionUnitPriceFromCatalog(tx)
+  if (unit > 0) return orderTransactionQtyValue(tx) * unit
+  return 0
+}
+
+function orderTransactionGrossAmount(tx) {
+  return orderTransactionApiLineTotal(tx) ?? 0
+}
+
 function orderTransactionAmountValue(tx) {
-  return orderTransactionLineTotal(tx)
+  return orderTransactionGrossAmount(tx)
 }
 
 function findUkraineProductForOrderTransaction(tx) {
-  const products = listProductsByCatalog('ukraine')
-  const sku = orderTransactionSkuLabel(tx)
-  const skuKey = productSkuKey(sku)
+  if (!tx) return null
+  const lookup = buildUkraineProductLookupMaps()
+  const items = orderTransactionItems(tx)
+  for (const item of items) {
+    const matched = findUkraineProductForOrderItem(item, lookup)
+    if (matched) return matched
+  }
+  const skuKey = productSkuKey(orderTransactionArticleSku(tx.article))
   if (skuKey) {
-    const match = products.find((product) => (
-      productSkuKey(product.sku) === skuKey
-      || productSkuKey(productUkraineArticleLabel(product)) === skuKey
-      || productSkuKey(productDisplaySku(product)) === skuKey
-    ))
+    const match = lookup.bySkuKey.get(skuKey) || findUkraineProductByAnySku(skuKey)
     if (match) return match
   }
-  const productName = orderTransactionProductName(tx) || String(tx?.firstName || '').trim()
+  const productName = (orderTransactionProductName(tx) || String(tx?.firstName || '').trim()).toLowerCase()
   if (!productName) return null
-  return products.find((p) => (
-    productDisplayName(p).toLowerCase() === productName.toLowerCase()
-  )) || null
+  return lookup.byName.get(productName) || null
 }
 
 function orderTransactionStoredUnitPrice(tx) {
@@ -1775,18 +2772,31 @@ function orderTransactionStoredUnitPrice(tx) {
 }
 
 function orderTransactionUnitPrice(tx) {
-  return orderTransactionStoredUnitPrice(tx) ?? orderTransactionUnitPriceFromCatalog(tx)
+  const catalog = orderTransactionUnitPriceFromCatalog(tx)
+  if (catalog > 0) return catalog
+  return orderTransactionStoredUnitPrice(tx) ?? 0
 }
 
-function orderTransactionUnitPriceFromCatalog(tx) {
+function orderTransactionUnitPriceFromCatalog(tx, product = null, item = null) {
   const shop = orderTransactionShopValue(tx)
-  const ukraine = findUkraineProductForOrderTransaction(tx)
+  const ukraine = product || findUkraineProductForOrderTransaction(tx)
   if (!ukraine) return 0
-  return ukraineProductOrderPrice(ukraine, shop)
+  const resolvedItem = item || (product ? orderTransactionItemForProduct(tx, product) : null)
+  const article = resolvedItem?.article ?? tx?.article ?? ''
+  return ukraineProductCatalogPrice(ukraine, { article, shop })
 }
 
 function orderTransactionLineTotal(tx) {
-  return orderTransactionQtyValue(tx) * orderTransactionUnitPrice(tx)
+  return orderTransactionGrossAmount(tx)
+}
+
+function orderTransactionMoneyCompareHtml(apiAmount, catalogAmount) {
+  const catalog = Number(catalogAmount)
+  const api = Number(apiAmount)
+  const hasCatalog = Number.isFinite(catalog) && catalog > 0
+  const hasApi = Number.isFinite(api) && api > 0
+  if (!hasCatalog && !hasApi) return escapeHtml('—')
+  return escapeHtml(productMoneyLabel(hasApi ? api : catalog))
 }
 
 function orderTransactionDeliveryValue(tx) {
@@ -1821,25 +2831,8 @@ function orderTransactionUnitCostForMargin(tx, fifoCostByTxId = null) {
   return productUkraineUnitCost(ukraine)
 }
 
-function orderTransactionMarginUnit(tx, fifoCostByTxId = null) {
-  const unitPrice = orderTransactionUnitPrice(tx)
-  if (unitPrice <= 0) return 0
-  const ukraine = findUkraineProductForOrderTransaction(tx)
-  if (!ukraine) return 0
-  const shop = orderTransactionShopValue(tx)
-  const priceField = ukraineProductShopPriceField(shop)
-  const marginField = priceField === 'priceRozetka' ? 'marginRozetka' : 'marginProm'
-  if (productUkraineHasManualMargin(ukraine, marginField)) {
-    return productUkraineManualMarginValue(ukraine, marginField)
-  }
-  const unitCost = orderTransactionUnitCostForMargin(tx, fifoCostByTxId)
-  if (unitCost == null || !Number.isFinite(unitCost)) return 0
-  const margin = productUkraineMarketplaceMargin(
-    unitPrice,
-    unitCost,
-    orderTransactionCommissionPct(ukraine, tx),
-  )
-  return margin != null && Number.isFinite(margin) ? margin : 0
+function orderTransactionMarginUnit(tx, _fifoCostByTxId = null) {
+  return orderTransactionUkraineListMarginUnit(tx)
 }
 
 function orderTransactionMarginTotal(tx, fifoCostByTxId = null) {
@@ -1899,21 +2892,43 @@ function findZakupkaProductByName(name) {
 
 function orderTransactionSkuLabel(tx) {
   const fromArticle = orderTransactionArticleSku(tx.article)
-  if (fromArticle) return fromArticle
+  const byArticle = fromArticle ? findUkraineProductByAnySku(fromArticle) : null
+  if (byArticle) {
+    const sku = String(productDisplaySku(byArticle) || '').trim()
+    if (sku && sku !== '—') return sku
+  }
+
   const productName = orderTransactionProductName(tx) || String(tx?.firstName || '').trim()
   if (productName) {
-    const zakupka = findZakupkaProductByName(productName)
-    if (zakupka?.sku) return String(zakupka.sku).trim()
     const ukraine = listProductsForUkraineTable().find((p) => (
       productDisplayName(p).toLowerCase() === productName.toLowerCase()
     ))
-    if (ukraine) return productDisplaySku(ukraine)
+    if (ukraine) {
+      const sku = String(productDisplaySku(ukraine) || '').trim()
+      if (sku && sku !== '—') {
+        if (!fromArticle || fromArticle.toLowerCase() === productName.toLowerCase()) {
+          return sku
+        }
+        if (findUkraineProductByAnySku(fromArticle)?.id === ukraine.id) return sku
+      }
+    }
+  }
+  if (fromArticle) return fromArticle
+  if (productName) {
+    const zakupka = findZakupkaProductByName(productName)
+    if (zakupka?.sku) return String(zakupka.sku).trim()
   }
   return ''
 }
 
 function getBazarioOrderPickOptions(field) {
-  if (field === 'status') return bazarioOrderStatuses.map((v) => ({ value: v, label: v }))
+  if (field === 'status') {
+    const { crm, rozetka } = getBazarioOrderStatusGroups()
+    return [
+      ...crm.map((v) => ({ value: v, label: v, group: 'crm' })),
+      ...rozetka.map((v) => ({ value: v, label: v, group: 'rozetka' })),
+    ]
+  }
   if (field === 'delivery') return bazarioDeliveryOptions.map((v) => ({ value: v, label: v }))
   return []
 }
@@ -1952,23 +2967,14 @@ function formatShortDotDate(iso) {
 }
 
 function orderTransactionDateValue(tx) {
-  const raw = tx?.date || tx?.createdAt
-  if (!raw) return ''
-  try {
-    const d = new Date(raw)
-    if (Number.isNaN(d.getTime())) return ''
-    const y = d.getFullYear()
-    const m = String(d.getMonth() + 1).padStart(2, '0')
-    const day = String(d.getDate()).padStart(2, '0')
-    return `${y}-${m}-${day}`
-  } catch {
-    return ''
-  }
+  return orderTransactionLocalDateKey(tx) || ''
 }
 
 function formatOrderTransactionDateLabel(tx) {
-  const raw = tx?.date || tx?.createdAt
-  return raw ? formatShortDotDate(raw) : '—'
+  const dayKey = orderTransactionLocalDateKey(tx)
+  if (!dayKey) return '—'
+  const [y, m, d] = dayKey.split('-')
+  return `${d}.${m}.${y.slice(-2)}`
 }
 
 function formatOrderTransactionTimeLabel(iso) {
@@ -1988,7 +2994,83 @@ function orderTransactionDateCellHtml(tx) {
   const timeHtml = timeLabel
     ? `<span class="product-tx-date-time">${escapeHtml(timeLabel)}</span>`
     : ''
-  return `<span class="product-tx-date-stack"><span class="product-tx-date-day">${escapeHtml(dateLabel)}</span>${timeHtml}</span>`
+  const rozetkaIndicatorInactive = orderTransactionRowStrikethrough(tx)
+  const rozetkaIndicator = orderTransactionIsFromRozetkaApi(tx)
+    ? `<span class="order-tx-rozetka-indicator${rozetkaIndicatorInactive ? ' order-tx-rozetka-indicator--inactive' : ''}" title="Rozetka API" aria-label="Rozetka API"></span>`
+    : ''
+  const dateStack = `<span class="product-tx-date-stack"><span class="product-tx-date-day">${escapeHtml(dateLabel)}</span>${timeHtml}</span>`
+  if (!rozetkaIndicator) return dateStack
+  return `<span class="order-tx-date-with-indicator">${rozetkaIndicator}${dateStack}</span>`
+}
+
+function orderTransactionIsFromRozetkaApi(tx) {
+  return Boolean(tx?.source === 'rozetka' || tx?.rozetkaOrderId != null)
+}
+
+function orderTransactionLatestStatusEntryFromHistory(history) {
+  if (!Array.isArray(history) || !history.length) return null
+  return [...history].sort((a, b) => {
+    const diff = new Date(a.at).getTime() - new Date(b.at).getTime()
+    if (diff !== 0) return diff
+    return String(a.statusRozetka || a.status || '').localeCompare(String(b.statusRozetka || b.status || ''))
+  }).at(-1)
+}
+
+function orderTransactionStoredStatus(tx) {
+  const status = String(tx?.status ?? '').trim()
+  return status || bazarioOrderStatuses[0]
+}
+
+function orderTransactionIsManualStatus(tx) {
+  return Boolean(tx?.statusManual)
+}
+
+function orderTransactionLatestStatusEntry(tx) {
+  const rozetkaHistory = Array.isArray(tx?.rozetkaStatusHistory) ? tx.rozetkaStatusHistory : []
+  if (rozetkaHistory.length) {
+    return window.BazarioRozetkaSync?.latestRozetkaStatusEntryFromHistory?.(rozetkaHistory)
+      || orderTransactionLatestStatusEntryFromHistory(rozetkaHistory)
+  }
+  const history = getOrderTransactionStatusHistory(tx)
+  if (!history.length) return null
+  return orderTransactionLatestStatusEntryFromHistory(history)
+}
+
+function orderTransactionLatestStatusAt(tx) {
+  if (orderTransactionIsManualStatus(tx)) {
+    const history = getOrderTransactionStatusHistory(tx)
+    const entry = history.length ? history[history.length - 1] : null
+    return entry?.at || tx?.updatedAt || null
+  }
+  const entry = orderTransactionLatestStatusEntry(tx)
+  if (entry?.at) return entry.at
+  if (orderTransactionIsFromRozetkaApi(tx)) {
+    return tx?.rozetkaOrderDetails?.updated || tx?.updatedAt || null
+  }
+  return null
+}
+
+function orderTransactionRozetkaHistoryEntries(tx) {
+  const history = Array.isArray(tx?.rozetkaStatusHistory) ? [...tx.rozetkaStatusHistory] : []
+  return history.sort((a, b) => new Date(b.at).getTime() - new Date(a.at).getTime())
+}
+
+/** Останній актуальний статус для відображення (з історії Rozetka або ручний CRM-статус). */
+function orderTransactionActiveStatusLabel(tx) {
+  if (orderTransactionIsManualStatus(tx)) {
+    return orderTransactionStoredStatus(tx)
+  }
+  const latest = orderTransactionLatestStatusEntry(tx)
+  if (latest) {
+    const label = String(latest.statusRozetka || latest.status || '').trim()
+    if (label) return label
+  }
+  if (orderTransactionIsFromRozetkaApi(tx)) {
+    const fromDetails = String(tx?.rozetkaOrderDetails?.status?.nameUk || '').trim()
+    if (fromDetails) return fromDetails
+  }
+  const status = String(tx?.status ?? '').trim()
+  return status || bazarioOrderStatuses[0]
 }
 
 function orderTransactionQtyValue(tx) {
@@ -1997,45 +3079,119 @@ function orderTransactionQtyValue(tx) {
 }
 
 function orderTransactionStatusValue(tx) {
-  const status = String(tx?.status ?? '').trim()
-  return status || bazarioOrderStatuses[0]
+  return orderTransactionActiveStatusLabel(tx)
 }
 
 function orderTransactionIsSale(tx) {
-  return orderTransactionStatusValue(tx) === ORDER_TRANSACTION_SALE_STATUS
+  const raw = normalizeOrderStatusKey(orderTransactionStatusValue(tx))
+  if (raw === normalizeOrderStatusKey(ORDER_TRANSACTION_SALE_STATUS)) return true
+  if (ORDER_TRANSACTION_COMPLETED_SALE_PATTERNS.some((pattern) => pattern.test(raw))) return true
+  return orderTransactionEffectiveCrmStatus(tx) === ORDER_TRANSACTION_SALE_STATUS
 }
 
-/** Показувати в сповіщеннях будь-який статус, окрім «Продаж» та «Розпродаж». */
+function orderTransactionIsCancelledByBuyer(tx) {
+  const label = orderTransactionActiveStatusLabel(tx)
+  if (window.BazarioRozetkaSync?.isRozetkaCancelledByBuyerLabel?.(label)) {
+    return true
+  }
+  return /скасовано\s*покупцем/.test(normalizeOrderStatusKey(label))
+}
+
+function orderTransactionIsClearance(tx) {
+  const key = normalizeOrderStatusKey(orderTransactionActiveStatusLabel(tx))
+  return key === normalizeOrderStatusKey(ORDER_TRANSACTION_CLEARANCE_STATUS)
+}
+
+/** Перекреслити рядок замовлення (скасовано покупцем або «Розпродаж»). */
+function orderTransactionRowStrikethrough(tx) {
+  return orderTransactionIsCancelledByBuyer(tx) || orderTransactionIsClearance(tx)
+}
+
+/** Лічильник транзакцій у шапці таблиці — без скасованих і «Розпродаж». */
+function bazarioOrderTransactionsCount(transactions) {
+  return filterBazarioOrderTransactions(transactions)
+    .filter((tx) => !orderTransactionRowStrikethrough(tx))
+    .length
+}
+
+function rozetkaOrderItemIsCancelled(item, tx) {
+  if (item?.cancelled) return true
+  const purchaseStatus = Number(item?.status)
+  if (purchaseStatus === 0 || purchaseStatus === 2) return true
+  return orderTransactionIsCancelledByBuyer(tx)
+}
+
+/** Сума в «Разом» — лише замовлення зі статусом Rozetka «Замовлення виконано». */
+function orderTransactionIsZamovlenniaVikonano(tx) {
+  const raw = normalizeOrderStatusKey(orderTransactionStatusValue(tx))
+  return /^замовлення виконано$/.test(raw)
+}
+
+/** Усі замовлення магазинів обліку — сповіщення на кожну зміну статусу. */
 function orderTransactionShowInNotifications(tx) {
-  const status = orderTransactionStatusValue(tx)
-  return status !== ORDER_TRANSACTION_SALE_STATUS && status !== ORDER_TRANSACTION_CLEARANCE_STATUS
+  const shops = new Set(Object.values(ACCOUNTING_ORDER_SHOPS).map((cfg) => cfg.shop))
+  return shops.has(orderTransactionShopValue(tx))
 }
 
-/** Показувати в сповіщеннях будь-який статус, окрім «Продаж». */
-function orderTransactionIsBeforeSale(tx) {
-  return !orderTransactionIsSale(tx)
+/** Актуальні назви статусу з Rozetka API (історія / details), без ручного CRM. */
+function orderTransactionCurrentRozetkaStatusLabels(tx) {
+  if (!orderTransactionIsFromRozetkaApi(tx)) return []
+  const labels = []
+  const latest = orderTransactionLatestStatusEntry(tx)
+  if (latest) {
+    const label = String(latest.statusRozetka || latest.status || '').trim()
+    if (label) labels.push(label)
+    return [...new Set(labels)]
+  }
+  const detailsStatus = tx?.rozetkaOrderDetails?.status
+  const detailLabel = String(detailsStatus?.nameUk || detailsStatus?.name || '').trim()
+  if (detailLabel) labels.push(detailLabel)
+  const raw = String(tx?.status ?? '').trim()
+  if (raw) labels.push(raw)
+  return [...new Set(labels)]
 }
 
-function sumOrderTransactionsBeforeSale(monthKey = null) {
+/** Замовлення «В обробці»: CRM-статус або актуальний статус Rozetka API з маппінгу. */
+function orderTransactionIsInProcessing(tx) {
+  if (!tx) return false
+  if (orderTransactionEffectiveCrmStatus(tx) === ORDER_TRANSACTION_IN_PROCESSING_STATUS) return true
+  const isRoz = window.BazarioRozetkaSync?.isRozetkaInProcessingLabel
+  if (typeof isRoz !== 'function') return false
+  return orderTransactionCurrentRozetkaStatusLabels(tx).some((label) => isRoz(label))
+}
+
+function sumOrderTransactionsGross(transactions) {
+  if (!Array.isArray(transactions) || !transactions.length) return 0
+  return transactions.reduce((sum, tx) => sum + orderTransactionGrossAmount(tx), 0)
+}
+
+function sumOrderTransactionsZamovlenniaVikonano(transactions) {
+  if (!Array.isArray(transactions) || !transactions.length) return 0
+  return transactions
+    .filter(orderTransactionIsZamovlenniaVikonano)
+    .reduce((sum, tx) => sum + orderTransactionGrossAmount(tx), 0)
+}
+
+function sumOrderTransactionsInProcessing(monthKey = null) {
   return db.list('orderTransactions')
-    .filter(orderTransactionIsBeforeSale)
+    .filter(orderTransactionIsInProcessing)
     .filter((tx) => !monthKey || orderTransactionMatchesMonth(tx, monthKey))
-    .reduce((sum, tx) => sum + orderTransactionAmountValue(tx), 0)
+    .reduce((sum, tx) => sum + orderTransactionGrossAmount(tx), 0)
 }
 
 function orderTransactionDayKey(tx) {
-  return resolveFinanceDayKey(tx?.date || tx?.createdAt)
+  return orderTransactionLocalDateKey(tx)
 }
 
-function buildOrderTransactionsBeforeSaleByDay(monthKey) {
+function buildOrderTransactionsInProcessingByDay(monthKey) {
   const map = new Map()
   db.list('orderTransactions')
-    .filter(orderTransactionIsBeforeSale)
+    .filter(orderTransactionIsInProcessing)
     .filter((tx) => orderTransactionMatchesMonth(tx, monthKey))
     .forEach((tx) => {
       const dayKey = orderTransactionDayKey(tx)
       if (!dayKey) return
-      map.set(dayKey, (map.get(dayKey) || 0) + orderTransactionAmountValue(tx))
+      map.set(dayKey, (map.get(dayKey) || 0) + orderTransactionGrossAmount(tx))
     })
   return map
 }
@@ -2057,7 +3213,7 @@ function getOrderTransactionStatusHistory(tx) {
   if (Array.isArray(tx?.statusHistory) && tx.statusHistory.length) {
     return normalizeOrderTransactionStatusHistory(tx.statusHistory)
   }
-  const status = orderTransactionStatusValue(tx)
+  const status = orderTransactionStoredStatus(tx)
   const at = tx?.createdAt || tx?.date || tx?.updatedAt
   if (!at) return status ? [{ status, at: new Date().toISOString() }] : []
   return [{ status, at }]
@@ -2071,37 +3227,258 @@ function buildOrderTransactionStatusPatch(tx, newStatus) {
   return {
     status: newStatus,
     statusHistory: appendStatusHistory(base, newStatus, ts),
+    statusManual: true,
   }
 }
 
 function applyInitialOrderTransactionStatusHistory(payload) {
-  const status = orderTransactionStatusValue(payload)
+  const status = orderTransactionStoredStatus(payload)
   const ts = payload.createdAt || payload.date || new Date().toISOString()
   payload.statusHistory = [{ status, at: ts }]
   return payload
 }
 
 function orderTransactionStatusHistoryBadgeClass(status) {
+  const key = normalizeOrderStatusKey(status)
+  if (!key) return ''
+
+  if (/нов.*замов|нов.*заказ/.test(key)) return 'order-tx-status-badge--new'
+  if (/оброб|менеджер|комплект|оплат.*очіку|дзвінок|не оброблено|повторне замов/.test(key)) {
+    return 'order-tx-status-badge--processing'
+  }
+  if (/заплан|передан|перев/.test(key)) return 'order-tx-status-badge--shipped'
+  if (/очіку.*продав|очіку.*відділ/.test(key)) return 'order-tx-status-badge--waiting'
+  if (/достав/.test(key)) return 'order-tx-status-badge--delivering'
+  if (/викон|отрим|заверш|автоматич/.test(key)) return 'order-tx-status-badge--done'
+  if (/поверн|скас|відмов|не вдал|немає|брак|втрач|кредит|оплат.*відсут/.test(key)) {
+    return 'order-tx-status-badge--cancel'
+  }
+
   const value = String(status ?? '').trim()
   if (value === 'Нове Замовлення') return 'order-tx-status-badge--new'
   if (value === 'В обробці') return 'order-tx-status-badge--processing'
+  if (value === 'Відправлено') return 'order-tx-status-badge--shipped'
+  if (value === 'Очікує на відділенні') return 'order-tx-status-badge--waiting'
   if (value === 'Доставляється') return 'order-tx-status-badge--delivering'
+  if (value === 'Продаж') return 'order-tx-status-badge--done'
+  if (value === 'Розпродаж') return 'order-tx-status-badge--clearance'
+  if (value === 'ПОВЕРНУТО') return 'order-tx-status-badge--cancel'
   return ''
 }
 
+function formatOrderStatusDateTime(iso) {
+  if (!iso) return '—'
+  try {
+    const d = new Date(iso)
+    if (Number.isNaN(d.getTime())) return '—'
+    return new Intl.DateTimeFormat('uk-UA', {
+      day: '2-digit',
+      month: '2-digit',
+      year: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+      timeZone: 'Europe/Kyiv',
+    }).format(d)
+  } catch {
+    return '—'
+  }
+}
+
+function rozetkaOrderDetailsFromTx(tx) {
+  if (tx?.rozetkaOrderDetails && typeof tx.rozetkaOrderDetails === 'object') {
+    return tx.rozetkaOrderDetails
+  }
+  if (!tx?.rozetkaOrderId && tx?.source !== 'rozetka') return null
+  const ttnRaw = String(tx?.ttnComment || '').trim()
+  const ttnMatch = ttnRaw.match(/ТТН:\s*([^·]+)/i)
+  return {
+    orderId: tx.rozetkaOrderId || null,
+    created: tx.date || tx.createdAt || null,
+    updated: tx.updatedAt || null,
+    status: { nameUk: tx.status || '—' },
+    amounts: {
+      amount: Number(tx.amount) || 0,
+      amountWithDiscount: Number(tx.amount) || 0,
+      totalQuantity: orderTransactionQtyValue(tx),
+    },
+    client: {
+      name: tx.firstName || '—',
+      phone: tx.phone || '',
+      email: '',
+    },
+    delivery: {
+      service: tx.delivery || '',
+      ttn: ttnMatch ? ttnMatch[1].trim() : '',
+    },
+    payment: { type: '', status: '' },
+    items: [{
+      name: tx.productName || '—',
+      article: tx.article || '',
+      quantity: orderTransactionQtyValue(tx),
+      price: orderTransactionUnitPrice(tx),
+    }],
+    comments: {
+      client: tx.clientComment || '',
+      seller: ttnRaw.replace(/^ТТН:[^·]*·?\s*/i, '').trim(),
+    },
+  }
+}
+
+function rozetkaOrderDetailField(label, value) {
+  let text = value
+  if (text != null && typeof text === 'object') {
+    text = text.city_name || text.name_ua || text.name || text.title || text.name_en || ''
+  }
+  text = String(text ?? '').trim()
+  if (!text) return ''
+  return `<div class="rozetka-order-detail-field">
+    <span class="rozetka-order-detail-label">${escapeHtml(label)}</span>
+    <span class="rozetka-order-detail-value">${escapeHtml(text)}</span>
+  </div>`
+}
+
+function renderRozetkaOrderItemsTable(items, tx = null) {
+  const rows = (Array.isArray(items) ? items : []).filter((item) => item?.name)
+  if (!rows.length) {
+    return '<p class="order-tx-status-history-empty muted">Товарів немає</p>'
+  }
+  return `<div class="rozetka-order-items-wrap">
+    <table class="rozetka-order-items-table">
+      <thead>
+        <tr>
+          <th>Товар</th>
+          <th>Артикул</th>
+          <th>К-ть</th>
+          <th>Ціна</th>
+          <th>Сума</th>
+        </tr>
+      </thead>
+      <tbody>${rows.map((item) => {
+        const qty = Math.max(1, Number(item.quantity) || 1)
+        const priceHtml = orderTransactionMoneyCompareForItem(item, tx, 'unit')
+        const sumHtml = orderTransactionMoneyCompareForItem(item, tx, 'line')
+        const rowClass = rozetkaOrderItemIsCancelled(item, tx)
+          ? ' class="rozetka-order-item-row--cancelled"'
+          : ''
+        return `<tr${rowClass}>
+          <td>${escapeHtml(item.name || '—')}</td>
+          <td>${escapeHtml(item.article || '—')}</td>
+          <td>${escapeHtml(String(qty))}</td>
+          <td class="rozetka-order-item-money">${priceHtml}</td>
+          <td class="rozetka-order-item-money">${sumHtml}</td>
+        </tr>`
+      }).join('')}</tbody>
+    </table>
+  </div>`
+}
+
+function renderRozetkaOrderDetailsHtml(tx) {
+  const details = rozetkaOrderDetailsFromTx(tx)
+  if (!details) return ''
+
+  const { status, amounts, client, delivery, payment, items, comments } = details
+  const amountValue = amounts?.amountWithDiscount || amounts?.amount || 0
+  const amountLabel = amountValue > 0 ? fmtMoney(amountValue) : '—'
+  const title = details.orderId
+    ? `Замовлення Rozetka №${details.orderId}`
+    : 'Замовлення Rozetka'
+
+  const generalFields = [
+    rozetkaOrderDetailField('Дата створення', formatOrderStatusDateTime(details.created)),
+    rozetkaOrderDetailField('Оновлено', details.updated ? formatOrderStatusDateTime(details.updated) : ''),
+    rozetkaOrderDetailField('Статус', orderTransactionActiveStatusLabel(tx)),
+    rozetkaOrderDetailField('Сума', amountLabel),
+    rozetkaOrderDetailField('Кількість', amounts?.totalQuantity ? String(amounts.totalQuantity) : ''),
+    rozetkaOrderDetailField('Оплата', payment?.type),
+    rozetkaOrderDetailField('Статус оплати', payment?.status),
+  ].filter(Boolean).join('')
+
+  const clientFields = [
+    rozetkaOrderDetailField('Клієнт', client?.name),
+    rozetkaOrderDetailField('Телефон', client?.phone),
+    rozetkaOrderDetailField('Email', client?.email),
+  ].filter(Boolean).join('')
+
+  const deliveryFields = [
+    rozetkaOrderDetailField('Служба доставки', delivery?.service),
+    rozetkaOrderDetailField('Спосіб доставки', delivery?.method),
+    rozetkaOrderDetailField('Місто', delivery?.city),
+    rozetkaOrderDetailField('Адреса / відділення', delivery?.warehouse || delivery?.address),
+    rozetkaOrderDetailField('Отримувач', delivery?.recipientName),
+    rozetkaOrderDetailField('Телефон отримувача', delivery?.recipientPhone),
+    rozetkaOrderDetailField('ТТН', delivery?.ttn),
+  ].filter(Boolean).join('')
+
+  const commentBlocks = [
+    comments?.client
+      ? `<div class="rozetka-order-comment-block">
+          <span class="rozetka-order-detail-label">Коментар покупця</span>
+          <p class="rozetka-order-comment-text">${escapeHtml(comments.client)}</p>
+        </div>`
+      : '',
+    comments?.seller
+      ? `<div class="rozetka-order-comment-block">
+          <span class="rozetka-order-detail-label">Коментар продавця</span>
+          <p class="rozetka-order-comment-text">${escapeHtml(comments.seller)}</p>
+        </div>`
+      : '',
+  ].filter(Boolean).join('')
+
+  return `
+    <section class="rozetka-order-details-section">
+      <h3 class="rozetka-order-details-title">${escapeHtml(title)}</h3>
+      <div class="rozetka-order-details-grid">${generalFields}</div>
+      ${clientFields ? `<div class="rozetka-order-details-block">
+        <h4 class="rozetka-order-details-subtitle">Клієнт</h4>
+        <div class="rozetka-order-details-grid">${clientFields}</div>
+      </div>` : ''}
+      ${deliveryFields ? `<div class="rozetka-order-details-block">
+        <h4 class="rozetka-order-details-subtitle">Доставка</h4>
+        <div class="rozetka-order-details-grid">${deliveryFields}</div>
+      </div>` : ''}
+      <div class="rozetka-order-details-block">
+        <h4 class="rozetka-order-details-subtitle">Товари</h4>
+        ${renderRozetkaOrderItemsTable(items, tx)}
+      </div>
+      ${commentBlocks ? `<div class="rozetka-order-details-block rozetka-order-comments-block">${commentBlocks}</div>` : ''}
+    </section>`
+}
+
 function renderOrderTransactionStatusHistoryHtml(tx) {
-  const history = getOrderTransactionStatusHistory(tx)
+  const rozetkaHistory = orderTransactionIsManualStatus(tx) ? [] : orderTransactionRozetkaHistoryEntries(tx)
+  const activeKey = normalizeOrderStatusKey(orderTransactionActiveStatusLabel(tx))
+  if (rozetkaHistory.length) {
+    return `<ul class="order-tx-status-history-list order-tx-rozetka-status-list order-tx-rozetka-timeline">${rozetkaHistory.map((entry) => {
+      const rozetkaName = entry.statusRozetka || entry.status || '—'
+      const badgeClass = orderTransactionStatusHistoryBadgeClass(rozetkaName)
+      const isCurrent = normalizeOrderStatusKey(rozetkaName) === activeKey
+      const currentClass = isCurrent ? ' order-tx-rozetka-status-item--current' : ''
+      return `
+      <li class="order-tx-status-history-item order-tx-rozetka-status-item task-status-history-item${currentClass}">
+        <span class="order-tx-status-badge order-tx-rozetka-status-badge${badgeClass ? ` ${badgeClass}` : ''}">${escapeHtml(rozetkaName)}</span>
+        <span class="order-tx-status-history-time task-status-history-time">${escapeHtml(formatOrderStatusDateTime(entry.at))}</span>
+      </li>`
+    }).join('')}</ul>`
+  }
+
+  const history = [...getOrderTransactionStatusHistory(tx)].reverse()
   if (!history.length) {
     return '<p class="order-tx-status-history-empty muted">Історії змін немає</p>'
   }
   return `<ul class="order-tx-status-history-list task-status-history-list">${history.map((entry) => {
     const badgeClass = orderTransactionStatusHistoryBadgeClass(entry.status)
+    const isCurrent = normalizeOrderStatusKey(entry.status) === activeKey
+    const currentClass = isCurrent ? ' order-tx-status-history-item--current' : ''
     return `
-    <li class="order-tx-status-history-item task-status-history-item">
+    <li class="order-tx-status-history-item task-status-history-item${currentClass}">
       <span class="order-tx-status-badge${badgeClass ? ` ${badgeClass}` : ''}">${escapeHtml(entry.status)}</span>
-      <span class="order-tx-status-history-time task-status-history-time">${escapeHtml(formatTaskDateTime(entry.at))}</span>
+      <span class="order-tx-status-history-time task-status-history-time">${escapeHtml(formatOrderStatusDateTime(entry.at))}</span>
     </li>`
   }).join('')}</ul>`
+}
+
+function normalizeOrderStatusKey(value) {
+  return String(value || '').trim().toLowerCase()
 }
 
 function renderOrderTransactionStatusBadge(status, { extraClass = '' } = {}) {
@@ -2113,12 +3490,13 @@ function renderOrderTransactionStatusBadge(status, { extraClass = '' } = {}) {
 
 function orderTransactionMatchesUkraineProduct(tx, product) {
   if (!tx || !product?.id) return false
-  const matched = findUkraineProductForOrderTransaction(tx)
-  return matched?.id === product.id
+  return Boolean(orderTransactionItemForProduct(tx, product))
 }
 
 function orderTransactionsForProduct(product) {
-  return db.list('orderTransactions').filter((tx) => orderTransactionMatchesUkraineProduct(tx, product))
+  if (!product?.id) return []
+  const index = buildOrderProductIndex()
+  return index.byProductId.get(product.id) || []
 }
 
 function orderTransactionsForProductInMonth(product, monthKey = null) {
@@ -2138,15 +3516,12 @@ function orderTransactionsSoldForProductInMonth(product, monthKey = null) {
 }
 
 function productUkraineOrderReservedQty(product) {
-  return orderTransactionsForProduct(product).reduce(
-    (sum, tx) => sum + orderTransactionQtyValue(tx),
-    0,
-  )
+  return productUkraineOrderSoldQty(product)
 }
 
 function productUkraineOrderSoldQty(product) {
   return orderTransactionsSoldForProduct(product).reduce(
-    (sum, tx) => sum + orderTransactionQtyValue(tx),
+    (sum, tx) => sum + orderTransactionQtyForProduct(tx, product),
     0,
   )
 }
@@ -2168,17 +3543,25 @@ function syncUkraineProductsAfterOrderTransaction(...txs) {
   txs.forEach((tx) => {
     if (tx == null) return
     const normalized = typeof tx === 'string' ? { article: tx } : tx
-    const product = findUkraineProductForOrderTransaction(normalized)
-    if (product?.id) productIds.add(product.id)
+    const items = orderTransactionItems(normalized)
+    if (items.length) {
+      items.forEach((item) => {
+        const product = findUkraineProductForOrderItem(item)
+        if (product?.id) productIds.add(product.id)
+      })
+    } else {
+      const product = findUkraineProductForOrderTransaction(normalized)
+      if (product?.id) productIds.add(product.id)
+    }
   })
-  if (activeNav === 'product' && isProductUkraineCatalog()) {
-    render()
-  } else {
-    productIds.forEach((productId) => {
-      const fresh = db.get('products', productId)
-      if (fresh) syncProductCollapsedRow(productId, fresh)
-    })
-  }
+  productIds.forEach((productId) => {
+    const fresh = db.get('products', productId)
+    if (!fresh) return
+    syncProductCollapsedRow(productId, fresh)
+    if (activeNav === 'product' && isProductUkraineCatalog() && expandedProductId === productId) {
+      syncProductUkraineOrderSection(productId, fresh)
+    }
+  })
   syncWarehouseCapacityDisplays()
 }
 
@@ -2288,8 +3671,41 @@ function orderTransactionShopValue(tx) {
   return tx?.shop || 'Bazario'
 }
 
+function dedupeRozetkaOrderTransactionsForDisplay(transactions) {
+  const byOrderId = new Map()
+  const rest = []
+  transactions.forEach((tx) => {
+    const orderId = tx?.rozetkaOrderId
+    if (orderId == null || orderId === '') {
+      rest.push(tx)
+      return
+    }
+    const key = String(orderId)
+    const prev = byOrderId.get(key)
+    if (!prev) {
+      byOrderId.set(key, tx)
+      return
+    }
+    const prevTime = new Date(prev.updatedAt || prev.createdAt || 0).getTime()
+    const nextTime = new Date(tx.updatedAt || tx.createdAt || 0).getTime()
+    if (nextTime >= prevTime) byOrderId.set(key, tx)
+  })
+  return [...rest, ...byOrderId.values()]
+}
+
 function listOrderTransactionsByShop(shop) {
-  return db.list('orderTransactions').filter((tx) => orderTransactionShopValue(tx) === shop)
+  ensureRozetkaOrderTransactionsConsolidated()
+  const list = db.list('orderTransactions').filter((tx) => orderTransactionShopValue(tx) === shop)
+  return dedupeRozetkaOrderTransactionsForDisplay(list)
+}
+
+function ensureRozetkaOrderTransactionsConsolidated() {
+  if (!window.BazarioRozetkaSync?.consolidateRozetkaTransactions) return null
+  const result = BazarioRozetkaSync.consolidateRozetkaTransactions()
+  if (result?.removed) {
+    syncUkraineProductsAfterOrderTransaction(...(result.transactions || []))
+  }
+  return result
 }
 
 function orderTransactionsMetaLabel(count) {
@@ -2337,18 +3753,26 @@ function orderTransactionPayloadFromForm(fd) {
     delivery: fd.get('delivery') || bazarioDeliveryOptions[0],
     ttnComment: String(fd.get('ttnComment') || '').trim(),
   }
+  if (payload.ttnComment) payload.ttnCommentManual = true
   return applyInitialOrderTransactionStatusHistory(payload)
+}
+
+const ORDER_PRODUCT_SUGGEST_LIMIT = 40
+
+function listProductsForOrderSuggest() {
+  return listProductsByCatalog('ukraine').filter((product) => !shouldRemoveUkraineAfterZakupkaDeletion(product))
 }
 
 function filterUkraineProductsForOrderSuggest(query) {
   const q = String(query || '').trim().toLowerCase()
-  const products = listProductsForUkraineTable()
-  if (!q) return products
-  return products.filter((product) => {
+  if (!q) return []
+  const products = listProductsForOrderSuggest()
+  const matched = products.filter((product) => {
     const name = productDisplayName(product).toLowerCase()
     const sku = String(productDisplaySku(product) || '').toLowerCase()
     return name.includes(q) || sku.includes(q)
   })
+  return matched.slice(0, ORDER_PRODUCT_SUGGEST_LIMIT)
 }
 
 function ukraineProductShopPriceField(shop) {
@@ -2381,9 +3805,14 @@ function renderBazarioOrderProductSuggest(input) {
   const wrap = input.closest('.order-product-suggest-wrap')
   const menu = wrap?.querySelector('.order-product-suggest-menu')
   if (!menu) return
+  const q = String(input.value || '').trim()
+  if (!q) {
+    hideBazarioOrderProductSuggest(input)
+    return
+  }
   const form = input.closest('form')
   const shop = orderShopFromForm(form)
-  const items = filterUkraineProductsForOrderSuggest(input.value)
+  const items = filterUkraineProductsForOrderSuggest(q)
   if (!items.length) {
     menu.innerHTML = '<div class="order-product-suggest-empty">Товарів не знайдено</div>'
     menu.classList.remove('is-hidden')
@@ -2477,8 +3906,8 @@ function renderBazarioOrderFormFields(values = {}) {
     <label class="form-field form-field-amount"><span>Ціна</span><input type="text" name="unitPrice" id="bazarioUnitPrice" inputmode="decimal" class="table-input account-amount-input${unitPriceValue ? ' account-amount-input--filled' : ''}" value="${escapeHtml(unitPriceValue)}" placeholder="0,0000" readonly tabindex="-1" autocomplete="off" /></label>
     <label class="form-field"><span>Кількість</span><input type="number" name="qty" id="bazarioQty" min="1" step="1" required value="${escapeHtml(String(v.qty || 1))}" /></label>
     <label class="form-field form-field-amount"><span>Сума</span><input type="text" id="bazarioLineTotal" class="table-input account-amount-input bazario-line-total-input" value="${lineTotalValue ? escapeHtml(amountInputFieldDisplay(lineTotalValue)) : '—'}" readonly tabindex="-1" autocomplete="off" /></label>
-    <label class="form-field"><span>Статус</span><select name="status" id="bazarioStatus" required>${renderSelectOptions(bazarioOrderStatuses, v.status)}</select></label>
-    <label class="form-field"><span>Доставка</span><select name="delivery" id="bazarioDelivery" required>${renderSelectOptions(bazarioDeliveryOptions, v.delivery)}</select></label>
+    <label class="form-field"><span>Статус</span><select name="status" id="bazarioStatus" required>${renderBazarioOrderStatusSelectOptions(v.status)}</select></label>
+    <label class="form-field bazario-delivery-field${marketplaceHighlightClass(v.delivery) ? ` ${marketplaceHighlightClass(v.delivery)}` : ''}"><span>Доставка</span><select name="delivery" id="bazarioDelivery" class="${marketplaceHighlightClass(v.delivery)}" required>${renderSelectOptions(bazarioDeliveryOptions, v.delivery)}</select></label>
     <label class="form-field"><span>Наша ТТН/Коментар</span><textarea name="ttnComment" id="bazarioTtnComment" rows="2" placeholder="ТТН або коментар">${escapeHtml(v.ttnComment)}</textarea></label>`
 }
 
@@ -2487,16 +3916,50 @@ function filterBazarioOrderTransactions(transactions) {
   return transactions.filter((tx) => !q || orderTransactionSearchText(tx).toLowerCase().includes(q))
 }
 
-function bazarioOrderPickCell(txId, field, tx) {
-  const display = getBazarioOrderPickDisplay(tx, field) || '—'
-  const options = getBazarioOrderPickOptions(field)
-  const current = field === 'delivery' ? (tx?.delivery || tx?.payment) : tx?.[field]
-  const selected = options.some((o) => o.value === current) ? current : (options[0]?.value ?? '')
+function renderOrderTransactionStatusCellHtml(tx) {
+  const current = orderTransactionActiveStatusLabel(tx)
+  if (!current) return '—'
+  const badgeClass = orderTransactionStatusHistoryBadgeClass(current)
+  const latestAt = orderTransactionLatestStatusAt(tx)
+  const statusTimeHtml = latestAt
+    ? `<span class="order-tx-status-cell-time">${escapeHtml(formatOrderStatusDateTime(latestAt))}</span>`
+    : ''
+  return `<span class="order-tx-status-cell-stack">
+    <span class="order-tx-status-badge${badgeClass ? ` ${badgeClass}` : ''}">${escapeHtml(current)}</span>
+    ${statusTimeHtml}
+  </span>`
+}
 
-  const arrowControl = options.length
+function bazarioOrderPickCell(txId, field, tx) {
+  const current = field === 'status'
+    ? orderTransactionActiveStatusLabel(tx)
+    : field === 'delivery'
+      ? (tx?.delivery || tx?.payment)
+      : tx?.[field]
+  const highlightClass = field === 'delivery' ? marketplaceHighlightClass(current || tx?.[field]) : ''
+
+  let displayHtml = ''
+  if (field === 'status') {
+    displayHtml = renderOrderTransactionStatusCellHtml(tx)
+  } else {
+    displayHtml = escapeHtml(getBazarioOrderPickDisplay(tx, field) || '—')
+  }
+
+  let optionsHtml = ''
+  if (field === 'status') {
+    optionsHtml = renderBazarioOrderStatusSelectOptions(current)
+  } else {
+    const options = getBazarioOrderPickOptions(field)
+    const selected = options.some((o) => o.value === current) ? current : (options[0]?.value ?? '')
+    optionsHtml = options.map(
+      (o) => `<option value="${escapeHtml(o.value)}"${o.value === selected ? ' selected' : ''}>${escapeHtml(o.label)}</option>`,
+    ).join('')
+  }
+
+  const arrowControl = optionsHtml
     ? `<span class="account-pick-arrow-wrap">
         <select class="account-pick-select bazario-order-pick-select" data-order-tx-id="${txId}" data-field="${field}" aria-label="Вибір" tabindex="-1">
-          ${options.map((o) => `<option value="${escapeHtml(o.value)}"${o.value === selected ? ' selected' : ''}>${escapeHtml(o.label)}</option>`).join('')}
+          ${optionsHtml}
         </select>
         <span class="account-pick-arrow" aria-hidden="true"></span>
       </span>`
@@ -2504,9 +3967,12 @@ function bazarioOrderPickCell(txId, field, tx) {
         <span class="account-pick-arrow" aria-hidden="true"></span>
       </button>`
 
-  return `<td class="account-pick-cell bazario-order-pick-cell" data-order-tx-id="${txId}" data-field="${field}">
-    <div class="account-pick-wrap">
-      <span class="account-pick-value">${escapeHtml(display)}</span>
+  const titleAttr = (field === 'status' || field === 'delivery') && current
+    ? ` title="${escapeHtml(String(current))}"`
+    : ''
+  return `<td class="account-pick-cell bazario-order-pick-cell" data-order-tx-id="${txId}" data-field="${field}"${titleAttr}>
+    <div class="account-pick-wrap${highlightClass ? ` ${highlightClass}` : ''}">
+      <span class="account-pick-value">${displayHtml}</span>
       ${arrowControl}
     </div>
   </td>`
@@ -2515,10 +3981,12 @@ function bazarioOrderPickCell(txId, field, tx) {
 function bazarioOrderClientCell(tx) {
   const name = tx.firstName || '—'
   const isExpanded = expandedOrderTxCommentId === tx.id
-  return `<td class="bazario-order-client-cell">
+  const isRozetka = Boolean(tx?.rozetkaOrderId || tx?.source === 'rozetka' || tx?.rozetkaOrderDetails)
+  const nameTitle = name && name !== '—' ? ` title="${escapeHtml(name)}"` : ''
+  return `<td class="bazario-order-client-cell"${nameTitle}>
     <button type="button" class="bazario-order-client-toggle account-name-toggle${isExpanded ? ' is-expanded' : ''}"
       data-order-tx-client-toggle="${tx.id}" aria-expanded="${isExpanded ? 'true' : 'false'}"
-      aria-label="Історія статусів — ${escapeHtml(name)}">
+      aria-label="${isRozetka ? 'Деталі замовлення Rozetka' : 'Історія статусів'} — ${escapeHtml(name)}"${nameTitle}>
       <span class="bazario-order-client-name account-name-value">${escapeHtml(name)}</span>
       <span class="account-name-chevron" aria-hidden="true"></span>
     </button>
@@ -2528,18 +3996,28 @@ function bazarioOrderClientCell(tx) {
 function bazarioOrderClientCommentRow(tx) {
   if (expandedOrderTxCommentId !== tx.id) return ''
   const comment = tx.clientComment ?? ''
+  const isRozetka = Boolean(tx?.rozetkaOrderId || tx?.source === 'rozetka' || tx?.rozetkaOrderDetails)
+  const hasRozetkaHistory = Array.isArray(tx?.rozetkaStatusHistory) && tx.rozetkaStatusHistory.length
+  const statusTitle = hasRozetkaHistory
+    ? 'Історія статусів'
+    : `Історія статусів · ${tx.firstName || '—'}`
+  const rozetkaDetailsHtml = isRozetka ? renderRozetkaOrderDetailsHtml(tx) : ''
+  const statusSectionHtml = hasRozetkaHistory || !isRozetka
+    ? `<div class="order-tx-status-history-section">
+        <span class="account-detail-label">${escapeHtml(statusTitle)}</span>
+        <div class="order-tx-status-history-wrap" data-order-tx-id="${tx.id}">
+          ${renderOrderTransactionStatusHistoryHtml(tx)}
+        </div>
+      </div>`
+    : ''
   return `
     <tr class="bazario-order-comment-row account-detail-row" data-order-tx-id="${tx.id}">
       <td colspan="${bazarioOrderTableColSpan()}">
         <div class="bazario-order-client-detail-panel">
-          <div class="order-tx-status-history-section">
-            <span class="account-detail-label">Історія статусів · ${escapeHtml(tx.firstName || '—')}</span>
-            <div class="order-tx-status-history-wrap" data-order-tx-id="${tx.id}">
-              ${renderOrderTransactionStatusHistoryHtml(tx)}
-            </div>
-          </div>
+          ${rozetkaDetailsHtml}
+          ${statusSectionHtml}
           <label class="bazario-order-comment-field account-notes-field">
-            <span class="bazario-order-comment-label account-detail-label">Коментар</span>
+            <span class="bazario-order-comment-label account-detail-label">Коментар CRM</span>
             <textarea class="table-input bazario-order-comment-input account-notes-input" data-order-tx-id="${tx.id}" rows="3" placeholder="Додайте коментар до клієнта...">${escapeHtml(comment)}</textarea>
           </label>
         </div>
@@ -2547,9 +4025,36 @@ function bazarioOrderClientCommentRow(tx) {
     </tr>`
 }
 
-function bazarioOrderMoneyCell(value) {
-  const label = productMoneyLabel(value)
-  return `<td class="bazario-order-money-cell">${escapeHtml(label)}</td>`
+function orderTransactionMoneyCompareForItem(item, tx, kind) {
+  const product = findUkraineProductForOrderItem(item)
+  const shop = orderTransactionShopValue(tx)
+  const catalog = kind === 'unit'
+    ? (product ? ukraineProductCatalogPrice(product, { article: item?.article, shop }) : 0)
+    : orderTransactionCatalogLineTotalForItem(item, tx)
+  const api = kind === 'unit'
+    ? orderTransactionApiUnitPriceForItem(item)
+    : orderTransactionApiLineTotalForItem(item, tx)
+  return orderTransactionMoneyCompareHtml(api, catalog)
+}
+
+function bazarioOrderMoneyCell(tx, kind) {
+  const items = orderTransactionActiveItems(tx)
+  if (items.length > 1) {
+    const blocks = items.map((item) => (
+      `<span class="bazario-order-money-compare-item">${orderTransactionMoneyCompareForItem(item, tx, kind)}</span>`
+    )).join('')
+    return `<td class="bazario-order-money-cell bazario-order-money-cell--multi">${blocks}</td>`
+  }
+  if (items.length === 1) {
+    return `<td class="bazario-order-money-cell">${orderTransactionMoneyCompareForItem(items[0], tx, kind)}</td>`
+  }
+  const catalog = kind === 'unit'
+    ? orderTransactionUnitPriceFromCatalog(tx)
+    : orderTransactionCatalogLineTotal(tx)
+  const api = kind === 'unit'
+    ? orderTransactionApiUnitPrice(tx)
+    : orderTransactionApiLineTotal(tx)
+  return `<td class="bazario-order-money-cell">${orderTransactionMoneyCompareHtml(api, catalog)}</td>`
 }
 
 function bazarioOrderTtnCommentCell(txId, tx) {
@@ -2572,21 +4077,22 @@ function bazarioOrderTableRows(transactions) {
     .sort((a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime())
     .map((tx) => {
       const sku = orderTransactionSkuLabel(tx)
-      const unitPrice = orderTransactionUnitPrice(tx)
-      const lineTotal = orderTransactionLineTotal(tx)
       const isExpanded = expandedOrderTxCommentId === tx.id
+      const cancelledRowClass = orderTransactionRowStrikethrough(tx)
+        ? ' bazario-order-row--cancelled-by-buyer'
+        : ''
       const deleteCell = orderShopDeleteMode
         ? `<td class="td-actions bazario-order-delete-cell"><button type="button" class="btn-icon btn-delete-inline" data-delete-order-tx="${tx.id}" title="Видалити" aria-label="Видалити">×</button></td>`
         : ''
       return `
-      <tr class="bazario-order-row${isExpanded ? ' bazario-order-row-expanded account-row-expanded' : ''}" data-order-tx-id="${tx.id}" data-search="${escapeHtml(orderTransactionSearchText(tx))}">
+      <tr class="bazario-order-row${cancelledRowClass}${isExpanded ? ' bazario-order-row-expanded account-row-expanded' : ''}" data-order-tx-id="${tx.id}" data-search="${escapeHtml(orderTransactionSearchText(tx))}">
         <td class="account-date-cell account-date-cell--stack">${orderTransactionDateCellHtml(tx)}</td>
         ${bazarioOrderClientCell(tx)}
-        <td class="bazario-order-phone-cell">${escapeHtml(tx.phone || '—')}</td>
-        <td class="account-article-cell bazario-order-sku-cell">${escapeHtml(sku || '—')}</td>
-        ${bazarioOrderMoneyCell(unitPrice)}
+        <td class="bazario-order-phone-cell"${tx.phone ? ` title="${escapeHtml(tx.phone)}"` : ''}>${escapeHtml(tx.phone || '—')}</td>
+        <td class="account-article-cell bazario-order-sku-cell"${sku ? ` title="${escapeHtml(sku)}"` : ''}>${escapeHtml(sku || '—')}</td>
+        ${bazarioOrderMoneyCell(tx, 'unit')}
         <td class="bazario-order-qty-cell">${escapeHtml(String(orderTransactionQtyValue(tx)))}</td>
-        ${bazarioOrderMoneyCell(lineTotal)}
+        ${bazarioOrderMoneyCell(tx, 'line')}
         ${bazarioOrderPickCell(tx.id, 'status', tx)}
         ${bazarioOrderPickCell(tx.id, 'delivery', tx)}
         ${bazarioOrderTtnCommentCell(tx.id, tx)}
@@ -2599,13 +4105,14 @@ function bazarioOrderTableRows(transactions) {
 
 function renderBazarioOrdersTable(transactions) {
   const filtered = filterBazarioOrderTransactions(transactions)
+  const countForBadge = bazarioOrderTransactionsCount(transactions)
   return `
     <section class="card table-card profiles-fullwidth bazario-orders-table-card${orderShopDeleteMode ? ' bazario-orders-delete-mode' : ''}" data-searchable>
       <div class="card-head">
         <div class="accounts-card-head-title">
           <h2>Транзакції по замовленнях</h2>
         </div>
-        <button type="button" class="count-badge count-badge-btn${orderShopDeleteMode ? ' is-active' : ''}" id="orderShopDeleteToggle" aria-pressed="${orderShopDeleteMode ? 'true' : 'false'}" title="${orderShopDeleteMode ? 'Завершити видалення' : 'Видалити транзакції'}">${filtered.length}</button>
+        <button type="button" class="count-badge count-badge-btn${orderShopDeleteMode ? ' is-active' : ''}" id="orderShopDeleteToggle" aria-pressed="${orderShopDeleteMode ? 'true' : 'false'}" title="${orderShopDeleteMode ? 'Завершити видалення' : 'Видалити транзакції'}">${countForBadge}</button>
       </div>
       <div class="table-wrap table-wrap-wide">
         <table class="data-table bazario-orders-data-table">
@@ -2624,16 +4131,16 @@ function renderBazarioOrdersTable(transactions) {
           </colgroup>
           <thead>
             <tr>
-              <th>Дата</th>
-              <th>Клієнт</th>
-              <th>Телефон</th>
-              <th>Артикул SKU</th>
-              <th class="account-amount-th">Ціна</th>
-              <th>Кількість</th>
-              <th class="account-amount-th">Сума</th>
-              <th>Статус</th>
-              <th>Доставка</th>
-              <th>Наша ТТН/Коментар</th>
+              <th class="bazario-th-date">Дата</th>
+              <th class="bazario-th-client">Клієнт</th>
+              <th class="bazario-th-phone">Телефон</th>
+              <th class="bazario-th-sku">Артикул SKU</th>
+              <th class="account-amount-th bazario-th-price">Ціна</th>
+              <th class="bazario-th-qty">К-сть</th>
+              <th class="account-amount-th bazario-th-sum">Сума</th>
+              <th class="bazario-th-status">Статус</th>
+              <th class="bazario-th-delivery">Доставка</th>
+              <th class="bazario-th-ttn">ТТН / Коментар</th>
               ${orderShopDeleteMode ? '<th class="bazario-order-delete-col" aria-label="Видалити"></th>' : ''}
             </tr>
           </thead>
@@ -2695,11 +4202,8 @@ function renderAccountingSectionCard(link, { modifier = '', actionAttr = '' } = 
 }
 
 function orderTransactionMonthKey(tx) {
-  const raw = tx?.date || tx?.createdAt
-  if (!raw) return null
-  const str = String(raw).trim()
-  if (/^\d{4}-\d{2}-\d{2}$/.test(str)) return str.slice(0, 7)
-  return financeMonthKey(raw)
+  const dayKey = orderTransactionLocalDateKey(tx)
+  return dayKey ? dayKey.slice(0, 7) : null
 }
 
 function orderTransactionMatchesMonth(tx, monthKey) {
@@ -2976,11 +4480,186 @@ function renderOrderShopTitleRow(config, monthKey) {
     </div>`
 }
 
+function rozetkaSyncEnabledForShop(shop) {
+  if (!window.BazarioRozetkaSync?.isEnabled?.()) return false
+  const cfgShop = String(window.BAZARIO_ROZETKA?.shop || 'Bazario').trim() || 'Bazario'
+  return shop === cfgShop
+}
+
+function rozetkaSyncMetaLabel(result, errorMessage) {
+  if (errorMessage) return String(errorMessage)
+  const last = BazarioRozetkaSync.getLastSyncAt()
+  const timeLine = last
+    ? `Остання синхр.: ${BazarioRozetkaSync.formatSyncTime(last)}`
+    : 'Ще не синхронізовано'
+  if (!result) return timeLine
+  const parts = []
+  if (result.created) parts.push(`+${result.created}`)
+  if (result.updated) parts.push(`↻${result.updated}`)
+  if (!parts.length) return timeLine
+  return `${timeLine} · ${parts.join(' · ')}`
+}
+
+function renderRozetkaSyncButton() {
+  return `<button type="button" class="btn-primary rozetka-sync-btn" id="rozetkaSyncBtn" aria-busy="false">
+        Синхронізувати Rozetka
+      </button>`
+}
+
+function renderRozetkaSyncMeta(shop) {
+  if (!rozetkaSyncEnabledForShop(shop)) return ''
+  const meta = rozetkaSyncMetaLabel(null, null)
+  return `<span class="rozetka-sync-meta" id="rozetkaSyncMeta">${escapeHtml(meta)}</span>`
+}
+
+function updateRozetkaSyncMeta(result, errorMessage) {
+  const meta = document.getElementById('rozetkaSyncMeta')
+  const btn = document.getElementById('rozetkaSyncBtn')
+  if (btn) {
+    btn.disabled = false
+    btn.setAttribute('aria-busy', 'false')
+    btn.textContent = 'Синхронізувати Rozetka'
+  }
+  if (!meta) return
+  meta.textContent = rozetkaSyncMetaLabel(result, errorMessage)
+}
+
+function syncOrderShopAccountingSummary(shop, monthKey, transactions) {
+  const completedOrders = transactions.filter(orderTransactionIsZamovlenniaVikonano)
+  const total = sumOrderTransactionsZamovlenniaVikonano(transactions)
+  const amountEl = document.querySelector('.bazario-accounting-summary-amount')
+  const metaEl = document.querySelector('.bazario-accounting-summary-meta')
+  if (amountEl) amountEl.textContent = fmtMoney(total)
+  if (metaEl) {
+    metaEl.textContent = `${orderTransactionsMetaLabel(completedOrders.length)} · Замовлення виконано`
+  }
+  const countBtn = document.getElementById('orderShopDeleteToggle')
+  if (countBtn) {
+    countBtn.textContent = String(bazarioOrderTransactionsCount(transactions))
+  }
+}
+
+function syncAccountingOverviewBazarioCard() {
+  if (activeNav !== 'accounting' || isOrderShopAccountingPage()) return
+  const monthKey = resolveAccountingPagePeriodMonthKey()
+  const bazarioOrders = listOrderTransactionsByShop('Bazario').filter((tx) => orderTransactionMatchesMonth(tx, monthKey))
+  const bazarioCompletedOrders = bazarioOrders.filter(orderTransactionIsZamovlenniaVikonano)
+  const card = document.querySelector('.accounting-link-card--bazario')
+  if (!card) return
+  const amountEl = card.querySelector('.accounting-link-amount')
+  const metaEl = card.querySelector('.accounting-link-meta')
+  if (amountEl) amountEl.textContent = fmtMoney(sumOrderTransactionsZamovlenniaVikonano(bazarioOrders))
+  if (metaEl) {
+    metaEl.textContent = `${orderTransactionsMetaLabel(bazarioCompletedOrders.length)} · Замовлення виконано`
+  }
+}
+
+function syncBazarioOrderRowLive(tx) {
+  if (!tx?.id) return false
+  const row = document.querySelector(`.bazario-order-row[data-order-tx-id="${tx.id}"]`)
+  if (!row) return false
+  const wrap = document.createElement('tbody')
+  wrap.innerHTML = bazarioOrderTableRows([tx])
+  const nextRow = wrap.querySelector('.bazario-order-row')
+  const nextComment = wrap.querySelector('.bazario-order-comment-row')
+  if (!nextRow) return false
+  row.replaceWith(nextRow)
+  const commentRow = document.querySelector(`.bazario-order-comment-row[data-order-tx-id="${tx.id}"]`)
+  if (commentRow) commentRow.remove()
+  if (nextComment) nextRow.insertAdjacentElement('afterend', nextComment)
+  return true
+}
+
+function syncOrderShopAccountingLive(result = {}) {
+  if (!isOrderShopAccountingPage()) return
+  const config = getAccountingOrderShopConfig()
+  if (!config) return
+  const monthKey = resolveOrderShopMonthKey()
+  const transactions = listOrderTransactionsByShopAndMonth(config.shop, monthKey)
+  syncOrderShopAccountingSummary(config.shop, monthKey, transactions)
+
+  const tbody = document.getElementById('bazarioOrdersTableBody')
+  if (!tbody) return
+
+  const changed = Array.isArray(result.changed) ? result.changed : []
+  const hasNew = (result.created || 0) > 0
+  const needsFullRefresh = hasNew || changed.some((tx) => !document.querySelector(`.bazario-order-row[data-order-tx-id="${tx?.id}"]`))
+
+  if (needsFullRefresh) {
+    const filtered = filterBazarioOrderTransactions(transactions)
+    tbody.innerHTML = bazarioOrderTableRows(filtered)
+    applySearchFilter()
+    return
+  }
+
+  let updatedAny = false
+  changed.forEach((tx) => {
+    if (syncBazarioOrderRowLive(tx)) updatedAny = true
+  })
+  if (changed.length && !updatedAny) {
+    const filtered = filterBazarioOrderTransactions(transactions)
+    tbody.innerHTML = bazarioOrderTableRows(filtered)
+    applySearchFilter()
+  }
+}
+
+function applyRozetkaSyncResult(result, { silent = false } = {}) {
+  if (!result || result.skipped) return
+  const hasChanges = (result.created || 0) > 0
+    || (result.updated || 0) > 0
+    || (result.changed?.length || 0) > 0
+
+  updateRozetkaSyncMeta(result)
+
+  if (!hasChanges) return
+
+  if (result.changed?.length) {
+    syncUkraineProductsAfterOrderTransaction(...result.changed)
+  }
+  syncNotificationsUI()
+  syncOrderShopAccountingLive(result)
+  syncAccountingOverviewBazarioCard()
+
+  if (silent && result.created > 0) {
+    showToast(`Rozetka: ${result.created} ${result.created === 1 ? 'нове замовлення' : 'нових замовлень'}`)
+  }
+
+  if (!silent) {
+    scheduleRemoteRender()
+  }
+}
+
+async function runRozetkaOrderSync({ silent = false } = {}) {
+  const btn = document.getElementById('rozetkaSyncBtn')
+  if (btn) {
+    btn.disabled = true
+    btn.setAttribute('aria-busy', 'true')
+    btn.textContent = 'Синхронізація…'
+  }
+  try {
+    const result = await BazarioRozetkaSync.syncOrders({ silent })
+    if (!silent) {
+      const msg = result.skipped
+        ? 'Синхронізація вже виконується'
+        : `Rozetka: ${result.created} нових, ${result.updated} оновлено`
+      showToast(msg)
+    }
+    applyRozetkaSyncResult(result, { silent })
+    return result
+  } catch (err) {
+    const message = err?.message || 'Помилка синхронізації Rozetka'
+    if (!silent) showToast(`Помилка: ${message}`)
+    updateRozetkaSyncMeta(null, message)
+    throw err
+  }
+}
+
 function renderOrderShopAccounting(config) {
   const monthKey = resolveOrderShopMonthKey()
   orderShopAccountingMonthKey = monthKey
   const transactions = listOrderTransactionsByShopAndMonth(config.shop, monthKey)
-  const total = transactions.reduce((s, tx) => s + orderTransactionAmountValue(tx), 0)
+  const completedOrders = transactions.filter(orderTransactionIsZamovlenniaVikonano)
+  const total = sumOrderTransactionsZamovlenniaVikonano(transactions)
   return `
     <div class="accounting-page bazario-accounting-page ${config.pageClass}" data-searchable>
       <div class="page-header finance-detail-header bazario-accounting-header">
@@ -2993,9 +4672,13 @@ function renderOrderShopAccounting(config) {
           <div class="bazario-accounting-summary">
             <span class="bazario-accounting-summary-label">Разом</span>
             <strong class="bazario-accounting-summary-amount">${fmtMoney(total)}</strong>
-            <span class="bazario-accounting-summary-meta">${orderTransactionsMetaLabel(transactions.length)}</span>
+            <span class="bazario-accounting-summary-meta">${orderTransactionsMetaLabel(completedOrders.length)} · Замовлення виконано</span>
           </div>
-          <button type="button" class="btn-primary" id="addOrderShopBtn">Додати транзакцію</button>
+          <div class="bazario-accounting-actions${rozetkaSyncEnabledForShop(config.shop) ? ' bazario-accounting-actions--sync' : ''}">
+            ${rozetkaSyncEnabledForShop(config.shop) ? renderRozetkaSyncButton() : ''}
+            <button type="button" class="btn-primary" id="addOrderShopBtn">Додати транзакцію</button>
+            ${renderRozetkaSyncMeta(config.shop)}
+          </div>
         </div>
       </div>
       ${renderBazarioOrdersTable(transactions)}
@@ -3147,11 +4830,12 @@ function renderAccounting() {
   const monthKey = resolveAccountingPagePeriodMonthKey()
   const accounts = db.list('accounts').filter((a) => accountMatchesMonth(a, monthKey))
   const bazarioOrders = listOrderTransactionsByShop('Bazario').filter((tx) => orderTransactionMatchesMonth(tx, monthKey))
+  const bazarioCompletedOrders = bazarioOrders.filter(orderTransactionIsZamovlenniaVikonano)
   const mixMarketOrders = listOrderTransactionsByShop('MІКС МАРКЕТ').filter((tx) => orderTransactionMatchesMonth(tx, monthKey))
   const advertisingExpenses = listAdvertisingExpensesForMonth(monthKey)
   const accountsTotal = accounts.reduce((s, a) => s + accountAmountValue(a), 0)
-  const bazarioTotal = bazarioOrders.reduce((s, tx) => s + orderTransactionAmountValue(tx), 0)
-  const mixMarketTotal = mixMarketOrders.reduce((s, tx) => s + orderTransactionAmountValue(tx), 0)
+  const bazarioTotal = sumOrderTransactionsZamovlenniaVikonano(bazarioOrders)
+  const mixMarketTotal = sumOrderTransactionsGross(mixMarketOrders)
   const advertisingTotal = advertisingExpenses.reduce((s, item) => s + (Number(item.amount) || 0), 0)
   const q = searchQuery.toLowerCase()
 
@@ -3164,9 +4848,9 @@ function renderAccounting() {
 
   const bazarioLink = {
     title: 'Bazario',
-    desc: 'Транзакції по замовленнях магазину',
+    desc: 'Сума замовлень зі статусом «Замовлення виконано»',
     amount: fmtMoney(bazarioTotal),
-    meta: orderTransactionsMetaLabel(bazarioOrders.length),
+    meta: `${orderTransactionsMetaLabel(bazarioCompletedOrders.length)} · Замовлення виконано`,
   }
 
   const mixMarketLink = {
@@ -3798,9 +5482,9 @@ function listWarehouseOutgoingEvents(warehouse) {
   const fifoCostByTxId = buildOrderTransactionFifoCostLookup()
   const events = []
   listWarehouseProductsForName(warehouse?.name).forEach((product) => {
-    orderTransactionsForProduct(product).forEach((tx) => {
+    orderTransactionsSoldForProduct(product).forEach((tx) => {
       const productName = orderTransactionProductName(tx) || productDisplayName(product) || '—'
-      const qty = orderTransactionQtyValue(tx)
+      const qty = orderTransactionQtyForProduct(tx, product)
       const unitCost = orderTransactionUnitCostForMargin(tx, fifoCostByTxId)
       events.push({
         dateRaw: tx.date || tx.createdAt,
@@ -4074,8 +5758,69 @@ function productCatalogOf(product) {
   return product?.catalog === 'ukraine' ? 'ukraine' : 'zakupka'
 }
 
+/** Кеш одного циклу render() — уникнення повторних db.list і O(n²) по замовленнях. */
+let renderCache = {
+  allProducts: null,
+  productsByCatalog: {},
+  orderIndex: null,
+}
+
+function invalidateRenderCaches() {
+  renderCache = {
+    allProducts: null,
+    productsByCatalog: {},
+    orderIndex: null,
+  }
+}
+
+function getAllProductsCached() {
+  if (!renderCache.allProducts) {
+    renderCache.allProducts = db.list('products')
+  }
+  return renderCache.allProducts
+}
+
 function listProductsByCatalog(catalog = productCatalogMode) {
-  return db.list('products').filter((p) => productCatalogOf(p) === catalog)
+  if (!renderCache.productsByCatalog[catalog]) {
+    renderCache.productsByCatalog[catalog] = getAllProductsCached().filter((p) => productCatalogOf(p) === catalog)
+  }
+  return renderCache.productsByCatalog[catalog]
+}
+
+function buildOrderProductIndex() {
+  if (renderCache.orderIndex) return renderCache.orderIndex
+
+  const { bySkuKey, byName } = buildUkraineProductLookupMaps()
+
+  const byProductId = new Map()
+  const txToProduct = new Map()
+  db.list('orderTransactions').forEach((tx) => {
+    const linkedProducts = new Map()
+    const items = orderTransactionItems(tx)
+    if (items.length) {
+      items.forEach((item) => {
+        const product = findUkraineProductForOrderItem(item, { bySkuKey, byName })
+        if (product?.id) linkedProducts.set(product.id, product)
+      })
+    } else {
+      let product = null
+      const skuKey = productSkuKey(orderTransactionArticleSku(tx.article))
+      if (skuKey) product = bySkuKey.get(skuKey) || findUkraineProductByAnySku(skuKey) || null
+      if (!product) {
+        const name = (orderTransactionProductName(tx) || String(tx?.firstName || '').trim()).toLowerCase()
+        if (name) product = byName.get(name) || null
+      }
+      if (product?.id) linkedProducts.set(product.id, product)
+    }
+    linkedProducts.forEach((product) => {
+      if (tx.id && !txToProduct.has(tx.id)) txToProduct.set(tx.id, product)
+      if (!byProductId.has(product.id)) byProductId.set(product.id, [])
+      byProductId.get(product.id).push(tx)
+    })
+  })
+
+  renderCache.orderIndex = { byProductId, txToProduct, bySkuKey, byName }
+  return renderCache.orderIndex
 }
 
 function productSkuKey(sku) {
@@ -4088,9 +5833,7 @@ function findUkraineProductByZakupka(zakupka) {
 }
 
 function findUkraineProductBySku(sku) {
-  const key = productSkuKey(sku)
-  if (!key) return null
-  return listProductsByCatalog('ukraine').find((p) => productSkuKey(p.sku) === key) || null
+  return findUkraineProductByAnySku(sku)
 }
 
 function findUkraineProductsLinkedToZakupka(zakupka) {
@@ -5195,7 +6938,7 @@ function orderTransactionFifoSortTime(tx) {
 function runUkraineFifoSimulation(product) {
   const layers = buildUkraineReplenishmentFifoLayers(product).map((layer) => ({ ...layer }))
   const fallbackCost = productUkraineUnitCost(product)
-  const transactions = orderTransactionsForProduct(product)
+  const transactions = orderTransactionsSoldForProduct(product)
     .slice()
     .sort((a, b) => {
       const ta = orderTransactionFifoSortTime(a)
@@ -5206,7 +6949,7 @@ function runUkraineFifoSimulation(product) {
 
   const costsByTxId = new Map()
   transactions.forEach((tx) => {
-    let qtyNeeded = orderTransactionQtyValue(tx)
+    let qtyNeeded = orderTransactionQtyForProduct(tx, product)
     let totalCost = 0
     let allocatedQty = 0
 
@@ -5324,13 +7067,13 @@ function productUkraineCollapsedCompareIndicator(product, field) {
 }
 
 function orderTransactionCommissionPct(product, tx) {
-  const priceField = ukraineProductShopPriceField(orderTransactionShopValue(tx))
+  const priceField = orderTransactionUkrainePriceField(tx, product)
   const commissionField = priceField === 'priceRozetka' ? 'commissionRozetka' : 'commissionProm'
   return productUkraineCommissionPctValue(product?.[commissionField])
 }
 
 function productUkraineOrderTransactionFifoMarginLabel(product, tx, fifoUnitCost) {
-  const unitPrice = orderTransactionUnitPrice(tx)
+  const unitPrice = orderTransactionUnitPriceFromCatalog(tx, product)
   if (unitPrice <= 0 || fifoUnitCost == null || !Number.isFinite(fifoUnitCost)) return '—'
   const marginUnit = productUkraineMarketplaceMargin(
     unitPrice,
@@ -5440,8 +7183,133 @@ function productUkraineCalculatedMarginRozetka(product, { useActiveCost = false 
 }
 
 function productUkraineArticleLabel(product) {
-  const sku = String(productDisplaySku(product) || '').trim()
-  return sku && sku !== '—' ? sku : '—'
+  const sku = String(product?.sku || '').trim()
+  if (sku) return sku
+  const fallback = String(productDisplaySku(product) || '').trim()
+  return fallback && fallback !== '—' ? fallback : '—'
+}
+
+function productUkrainePrimarySkuValue(product) {
+  return String(product?.sku || '').trim()
+}
+
+function productUkraineSkuStackInputs(product) {
+  return `<div class="product-ukraine-sku-stack">
+    ${productUkrainePrimarySkuInput(product)}
+    ${productUkraineAltSkuInput(product)}
+  </div>`
+}
+
+function productUkrainePrimarySkuInput(product) {
+  const value = productUkrainePrimarySkuValue(product)
+  const size = productDetailControlSize(value || 'SKU', 8, 18)
+  return `<input type="text" size="${size}" class="table-input product-ukraine-field-input product-ukraine-primary-sku-input product-detail-control product-detail-control-fit" data-product-id="${product.id}" data-ukraine-field="sku" value="${escapeHtml(value)}" placeholder="Основний SKU" aria-label="Основний SKU" />`
+}
+
+function productUkraineAltSku(product) {
+  return String(product?.skuAlt || '').trim()
+}
+
+function productUkraineSkuMatchKeys(product) {
+  const keys = new Set()
+  ;[
+    product?.sku,
+    productDisplaySku(product),
+    productUkraineArticleLabel(product),
+    productUkraineAltSku(product),
+  ].forEach((sku) => {
+    const key = productSkuKey(sku)
+    if (key) keys.add(key)
+  })
+  return keys
+}
+
+function findUkraineProductByAnySku(sku) {
+  const key = productSkuKey(sku)
+  if (!key) return null
+  return listProductsForUkraineTable().find((p) => productUkraineSkuMatchKeys(p).has(key)) || null
+}
+
+function parseOrderTransactionArticleParts(article) {
+  const raw = orderTransactionArticleSku(article)
+  if (!raw) return []
+  return raw.split(',').map((part) => part.trim()).filter(Boolean)
+}
+
+function ukraineProductPrimarySkuKeys(product) {
+  const keys = new Set()
+  ;[product?.sku, productDisplaySku(product), productUkraineArticleLabel(product)].forEach((sku) => {
+    const key = productSkuKey(sku)
+    if (key && key !== '—') keys.add(key)
+  })
+  return keys
+}
+
+/** Яка ціна зі списку Укр відповідає артикулу в замовленні (основний SKU → Prom, skuAlt → Rozetka). */
+function ukraineProductCatalogPriceFieldForArticle(product, article) {
+  const articleKey = productSkuKey(orderTransactionArticleSku(article))
+  if (!articleKey) return null
+  const altKey = productSkuKey(productUkraineAltSku(product))
+  if (altKey && articleKey === altKey) return 'priceRozetka'
+  if (ukraineProductPrimarySkuKeys(product).has(articleKey)) return 'priceProm'
+  return null
+}
+
+function ukraineProductCatalogPrice(product, { article = '', shop = 'Bazario' } = {}) {
+  if (!product) return 0
+  const parts = parseOrderTransactionArticleParts(article)
+  const candidates = parts.length ? parts : [orderTransactionArticleSku(article)].filter(Boolean)
+  for (const part of candidates) {
+    const field = ukraineProductCatalogPriceFieldForArticle(product, part)
+    if (field) {
+      const value = Number(product[field])
+      if (Number.isFinite(value)) return value
+    }
+  }
+  return ukraineProductOrderPrice(product, shop)
+}
+
+function orderTransactionUkrainePriceField(tx, product = null) {
+  const ukraine = product || findUkraineProductForOrderTransaction(tx)
+  const shop = orderTransactionShopValue(tx)
+  if (!ukraine) return ukraineProductShopPriceField(shop)
+  const item = product && tx ? orderTransactionItemForProduct(tx, ukraine) : null
+  const article = item?.article ?? tx?.article ?? ''
+  return ukraineProductCatalogPriceFieldForArticle(ukraine, article)
+    ?? ukraineProductShopPriceField(shop)
+}
+
+function orderTransactionUkraineMarginField(tx, product = null) {
+  const priceField = orderTransactionUkrainePriceField(tx, product)
+  return priceField === 'priceRozetka' ? 'marginRozetka' : 'marginProm'
+}
+
+/** Маржа за 1 шт. — та сама, що в колонці M. Prom / M. Rozetka списку «Товар Україна». */
+function orderTransactionUkraineListMarginUnit(tx, product = null) {
+  const ukraine = product || findUkraineProductForOrderTransaction(tx)
+  if (!ukraine) return 0
+  const marginField = orderTransactionUkraineMarginField(tx, ukraine)
+  const margin = marginField === 'marginRozetka'
+    ? productUkraineActiveMarginRozetka(ukraine)
+    : productUkraineActiveMarginProm(ukraine)
+  return margin != null && Number.isFinite(margin) ? margin : 0
+}
+
+function productUkraineArticleCellInner(product) {
+  const primary = productUkraineArticleLabel(product)
+  const alt = productUkraineAltSku(product)
+  if (!alt || alt === primary) return escapeHtml(primary || '—')
+  const title = `Основний SKU: ${primary} · SKU Rozetka: ${alt}`
+  return `<span class="product-ukraine-article-stack" title="${escapeHtml(title)}">
+    <span class="product-ukraine-article-primary">${escapeHtml(primary || '—')}</span>
+    <span class="product-ukraine-article-alt muted">${escapeHtml(alt)}</span>
+  </span>`
+}
+
+function productUkraineAltSkuInput(product) {
+  const value = productUkraineAltSku(product)
+  const size = productDetailControlSize(value || 'SKU Rozetka', 8, 18)
+  return `<input type="text" size="${size}" class="table-input product-ukraine-field-input product-ukraine-alt-sku-input product-detail-control product-detail-control-fit" data-product-id="${product.id}" data-ukraine-field="skuAlt" value="${escapeHtml(value)}" placeholder="SKU Rozetka" aria-label="SKU Rozetka" />`
 }
 
 function productUkraineStockLabel(product) {
@@ -5459,7 +7327,7 @@ function productUkraineSoldQtyLastDays(product, days = UKRAINE_STOCK_DAYS_LOOKBA
     if (!raw) return sum
     const d = new Date(raw)
     if (Number.isNaN(d.getTime()) || d < cutoff) return sum
-    return sum + orderTransactionQtyValue(tx)
+    return sum + orderTransactionQtyForProduct(tx, product)
   }, 0)
 }
 
@@ -5518,11 +7386,14 @@ function productUkraineWarehouseSelect(product) {
     return '<span class="product-detail-readonly-value muted">— Спочатку додайте склад —</span>'
   }
   const selected = productUkraineWarehouseValue(product)
+  const highlightClass = marketplaceHighlightClass(selected)
   const optionHtml = ['<option value="">—</option>']
     .concat(options.map((option) => (
       `<option value="${escapeHtml(option)}"${option === selected ? ' selected' : ''}>${escapeHtml(option)}</option>`
     )))
-  return `<select class="table-input table-select product-ukraine-warehouse-select product-detail-control product-detail-control-wide" data-product-id="${product.id}" data-ukraine-field="ukraineWarehouse" aria-label="Склад">${optionHtml.join('')}</select>`
+  const selectHtml = `<select class="table-input table-select product-ukraine-warehouse-select product-detail-control product-detail-control-wide" data-product-id="${product.id}" data-ukraine-field="ukraineWarehouse" aria-label="Склад">${optionHtml.join('')}</select>`
+  if (!highlightClass) return selectHtml
+  return `<span class="account-pick-wrap marketplace-field-wrap ${highlightClass}">${selectHtml}</span>`
 }
 
 function productUkraineNameInput(product) {
@@ -5890,7 +7761,6 @@ function listItemSortDateValue(item, field) {
 }
 
 function computeHomeInventoryValueStats() {
-  syncUkraineProductsFromZakupkaArrivals()
   let total = 0
   let productsWithStock = 0
   listProductsByCatalog('ukraine').forEach((product) => {
@@ -5910,7 +7780,6 @@ function computeHomeInventoryValueStats() {
 }
 
 function listProductsForUkraineTable() {
-  syncUkraineProductsFromZakupkaArrivals()
   return listProductsByCatalog('ukraine').filter((product) => !shouldRemoveUkraineAfterZakupkaDeletion(product))
 }
 
@@ -6054,17 +7923,17 @@ function productUkraineCollapsedTotalUnitLabel(product) {
 }
 
 function productUkraineOrderTransactionPrice(product, tx) {
-  return ukraineProductOrderPrice(product, orderTransactionShopValue(tx))
+  return orderTransactionUnitPriceFromCatalog(tx, product)
 }
 
 function productUkraineOrderTransactionTotal(product, tx) {
-  return productUkraineOrderTransactionPrice(product) * orderTransactionQtyValue(tx)
+  return orderTransactionApiLineTotal(tx, product) ?? 0
 }
 
 function productUkraineOrderTransactionMargin(product, tx) {
-  const price = productUkraineOrderTransactionPrice(product)
+  const price = productUkraineOrderTransactionPrice(product, tx)
   const purchaseUnit = productUkraineCollapsedTotalUnit(product)
-  const qty = orderTransactionQtyValue(tx)
+  const qty = orderTransactionQtyForProduct(tx, product)
   if (price <= 0 || purchaseUnit == null || !Number.isFinite(purchaseUnit)) return null
   const amount = price - purchaseUnit
   const percent = (amount / price) * 100
@@ -6271,6 +8140,7 @@ function productSearchText(product) {
     const parts = [
       productDisplayName(product),
       productUkraineArticleLabel(product),
+      productUkraineAltSku(product),
       productUkraineStockLabel(product),
       productUkraineWarehouseLabel(product),
       productUkraineUnitCostLabel(product),
@@ -6997,10 +8867,144 @@ function productZakupkaDateFieldFromCell(cell) {
   return ['paymentDate', 'shippingDate', 'arrivalDate'].includes(field) ? field : ''
 }
 
-function focusZakupkaDateInput(productId, field) {
+function resolveProductRowExpandId(row) {
+  if (!row) return ''
+  return row.dataset.manualStockItemId || row.dataset.productId || ''
+}
+
+function isProductRowInteractiveTarget(target) {
+  return Boolean(target?.closest(
+    'button, input, select, textarea, a, label, .product-sort-btn, .product-zakupka-col-toggle, .product-ukraine-commission-toggle, [data-zakupka-logistics-filter], [data-ukraine-warehouse-filter], [data-product-expand]',
+  ))
+}
+
+function findProductListItemByExpandId(expandId) {
+  if (!expandId) return null
+  const products = filterProductsForTable(listProductsForCurrentCatalog())
+  return products.find((item) => (
+    isManualStockListItem(item) ? item.id === expandId : listItemProduct(item).id === expandId
+  )) || null
+}
+
+function findProductCollapsedRowByExpandId(expandId) {
+  if (!expandId) return null
+  if (expandId.includes(':')) {
+    return document.querySelector(`tr.product-manual-stock-row[data-manual-stock-item-id="${expandId}"]`)
+  }
+  if (isProductUkraineCatalog()) {
+    return document.querySelector(`tr.product-ukraine-row[data-product-id="${expandId}"]`)
+  }
+  if (isProductZakupkaCatalog()) {
+    return document.querySelector(`tr.product-zakupka-row[data-product-id="${expandId}"]:not(.product-manual-stock-row)`)
+      || document.querySelector(`tr.product-zakupka-row[data-product-id="${expandId}"]`)
+  }
+  return document.querySelector(`tr.product-table-row[data-product-id="${expandId}"]`)
+}
+
+function isProductDetailTableRow(row) {
+  return row?.classList.contains('product-detail-row') || (
+    row?.classList.contains('task-detail-row') && !row?.classList.contains('product-ukraine-row')
+    && !row?.classList.contains('product-zakupka-row') && !row?.classList.contains('product-manual-stock-row')
+  )
+}
+
+function isProductCollapsedTableRow(row) {
+  return row?.classList.contains('product-ukraine-row')
+    || row?.classList.contains('product-zakupka-row')
+    || row?.classList.contains('product-manual-stock-row')
+    || (row?.classList.contains('product-table-row') && !isProductDetailTableRow(row))
+}
+
+function productRowHasDetailRows(expandId) {
+  const row = findProductCollapsedRowByExpandId(expandId)
+  if (!row) return false
+  return isProductDetailTableRow(row.nextElementSibling)
+}
+
+function removeProductDetailRowsForExpandId(expandId) {
+  const row = findProductCollapsedRowByExpandId(expandId)
+  if (!row) return
+  let next = row.nextElementSibling
+  while (next && isProductDetailTableRow(next)) {
+    const toRemove = next
+    next = next.nextElementSibling
+    toRemove.remove()
+  }
+}
+
+function buildProductDetailRowsHtml(expandId) {
+  const colSpan = productsTableColSpan()
+  if (isProductZakupkaCatalog()) {
+    const item = findProductListItemByExpandId(expandId)
+    if (!item) return ''
+    if (isManualStockListItem(item)) return productManualStockDetailRows(item, colSpan)
+    return productDetailRows(listItemProduct(item), colSpan)
+  }
+  if (isProductUkraineCatalog()) {
+    const product = db.get('products', expandId)
+    if (!product) return ''
+    return productDetailRows(product, colSpan)
+  }
+  const product = db.get('products', expandId)
+  if (!product) return ''
+  return productDetailRows(product, colSpan)
+}
+
+function insertProductDetailRowsForExpandId(expandId) {
+  if (productRowHasDetailRows(expandId)) return true
+  const row = findProductCollapsedRowByExpandId(expandId)
+  if (!row) return false
+  const html = buildProductDetailRowsHtml(expandId)
+  if (!html) return false
+  row.insertAdjacentHTML('afterend', html)
+  return true
+}
+
+function syncProductRowExpandedUi(expandId, expanded) {
+  const row = findProductCollapsedRowByExpandId(expandId)
+  if (!row) return
+  row.classList.toggle('task-row-expanded', expanded)
+  const btn = row.querySelector('[data-product-expand]')
+  if (btn) {
+    btn.classList.toggle('is-expanded', expanded)
+    btn.setAttribute('aria-expanded', expanded ? 'true' : 'false')
+  }
+}
+
+function toggleProductRowExpand(id) {
+  if (!id) return
+  if (activeNav === 'product' && (isProductUkraineCatalog() || isProductZakupkaCatalog())) {
+    const isOpen = expandedProductId === id || productRowHasDetailRows(id)
+    if (expandedProductId && expandedProductId !== id) {
+      removeProductDetailRowsForExpandId(expandedProductId)
+      syncProductRowExpandedUi(expandedProductId, false)
+    }
+    if (isOpen) {
+      expandedProductId = null
+      removeProductDetailRowsForExpandId(id)
+      syncProductRowExpandedUi(id, false)
+      return
+    }
+    expandedProductId = id
+    if (!insertProductDetailRowsForExpandId(id)) {
+      expandedProductId = null
+      render()
+      return
+    }
+    syncProductRowExpandedUi(id, true)
+    return
+  }
+  expandedProductId = expandedProductId === id ? null : id
+  render()
+}
+
+function focusZakupkaDateInput(productId, field, { lineId = '' } = {}) {
   if (!productId || !field) return
+  const rowSelector = lineId
+    ? `.product-manual-stock-detail-row-tr[data-product-id="${productId}"][data-manual-stock-line-id="${lineId}"]`
+    : `.product-zakupka-detail-row-tr[data-product-id="${productId}"]`
   const input = document.querySelector(
-    `.product-zakupka-detail-row-tr[data-product-id="${productId}"] .zakupka-date-input[data-zakupka-field="${field}"]`,
+    `${rowSelector} .zakupka-date-input[data-zakupka-field="${field}"]`,
   )
   if (!input) return
   input.focus()
@@ -7172,65 +9176,88 @@ function productUkraineOrderDetailHeaderRows() {
       ${productDetailFieldTd('', 'num', 'product-num-cell')}
       ${productUkraineDetailSectionTitleTd('<span class="product-ukraine-order-section-title">Продажі</span>', 'order')}
       ${deleteCell}
-    </tr>
-    <tr class="task-detail-row product-detail-row product-ukraine-order-label-row-tr" aria-hidden="true">
-      ${productDetailFieldTd('', 'num', 'product-num-cell')}
-      ${productDetailFieldTd('<span class="product-ukraine-order-col-label">Дата</span>', 'date', 'product-col-name-cell')}
-      ${productDetailFieldTd('<span class="product-ukraine-order-col-label">Клієнт</span>', 'sku', 'product-col-sku-cell')}
-      ${productDetailFieldTd('<span class="product-ukraine-order-col-label">Статус</span>', 'status', 'product-col-status-cell product-ukraine-order-status-cell')}
-      ${productDetailFieldTd('<span class="product-ukraine-order-col-label">К-ть</span>', 'qty', 'product-col-qty-cell product-ukraine-stock-cell')}
-      ${productUkraineDetailEmptyTd('product-col-warehouse-cell product-ukraine-warehouse-cell')}
-      ${productDetailFieldTd('<span class="product-ukraine-order-col-label">Ціна</span>', 'money', 'product-col-amount-cell product-ukraine-price-prom-cell')}
-      ${productDetailFieldTd('<span class="product-ukraine-order-col-label">Сума</span>', 'money', 'product-col-amount-cell product-ukraine-price-rozetka-cell')}
-      ${productDetailFieldTd('<span class="product-ukraine-order-col-label">Собівартість</span>', 'money', 'product-col-amount-cell product-ukraine-cost-cell')}
-      ${productDetailFieldTd('<span class="product-ukraine-order-col-label">Маржа</span>', 'money', 'product-col-amount-cell product-ukraine-commission-prom-cell product-ukraine-order-margin-cell')}
-      ${productUkraineDetailEmptyTd('product-col-amount-cell product-ukraine-commission-rozetka-cell')}
-      ${productUkraineDetailEmptyTd('product-col-amount-cell product-ukraine-margin-prom-cell')}
-      ${productUkraineDetailEmptyTd('product-col-amount-cell product-ukraine-margin-rozetka-cell')}
-      ${deleteCell}
     </tr>`
 }
 
-function productDetailUkraineOrderRow(product, tx, fifoCosts = null) {
-  const deleteCell = productUkraineDetailDeleteCell()
-  const soldQty = orderTransactionQtyValue(tx)
+function productUkraineOrderInnerRow(product, tx, fifoCosts = null) {
+  const soldQty = orderTransactionQtyForProduct(tx, product)
   const customer = tx.firstName || '—'
-  const unitPrice = orderTransactionUnitPrice(tx)
-  const lineTotal = orderTransactionLineTotal(tx)
+  const statusLabel = orderTransactionActiveStatusLabel(tx)
+  const catalogUnitPrice = orderTransactionUnitPriceFromCatalog(tx, product)
+  const catalogLineTotal = orderTransactionCatalogLineTotal(tx, product)
   const fifo = fifoCosts?.get?.(tx.id) || null
   const fifoUnitCost = fifo?.unitCost ?? null
   const costLabel = fifoUnitCost != null && Number.isFinite(fifoUnitCost)
     ? productMoneyLabel(fifoUnitCost)
     : '—'
   const marginLabel = productUkraineOrderTransactionFifoMarginLabel(product, tx, fifoUnitCost)
+  const cancelledClass = orderTransactionRowStrikethrough(tx)
+    ? ' product-ukraine-order-inner-row-tr--cancelled-by-buyer'
+    : ''
   return `
-    <tr class="task-detail-row product-detail-row product-ukraine-order-row-tr" data-order-tx-id="${tx.id}" data-search="${escapeHtml(productSearchText(product))}">
-      ${productDetailFieldTd('', 'num', 'product-num-cell')}
-      ${productDetailFieldTd(orderTransactionDateCellHtml(tx), 'date', 'product-col-name-cell')}
-      ${productDetailFieldTd(`<span class="product-detail-readonly-value product-ukraine-order-client">${escapeHtml(customer)}</span>`, 'sku', 'product-col-sku-cell')}
-      ${productDetailFieldTd(renderOrderTransactionStatusBadge(tx.status, { extraClass: 'product-ukraine-order-status' }), 'status', 'product-col-status-cell product-ukraine-order-status-cell')}
-      ${productDetailFieldTd(`<span class="product-detail-readonly-value product-ukraine-order-qty">${escapeHtml(String(soldQty))}</span>`, 'qty', 'product-col-qty-cell product-ukraine-stock-cell')}
-      ${productUkraineDetailEmptyTd('product-col-warehouse-cell product-ukraine-warehouse-cell')}
-      ${productDetailFieldTd(`<span class="product-detail-readonly-value product-ukraine-order-price">${escapeHtml(productMoneyLabel(unitPrice))}</span>`, 'money', 'product-col-amount-cell product-ukraine-price-prom-cell')}
-      ${productDetailFieldTd(`<span class="product-detail-readonly-value product-ukraine-order-sum">${escapeHtml(productMoneyLabel(lineTotal))}</span>`, 'money', 'product-col-amount-cell product-ukraine-price-rozetka-cell')}
-      ${productDetailFieldTd(`<span class="product-detail-readonly-value product-ukraine-order-cost">${escapeHtml(costLabel)}</span>`, 'money', 'product-col-amount-cell product-ukraine-cost-cell')}
-      ${productDetailFieldTd(`<span class="product-detail-readonly-value product-ukraine-order-margin">${escapeHtml(marginLabel)}</span>`, 'money', 'product-col-amount-cell product-ukraine-commission-prom-cell product-ukraine-order-margin-cell')}
-      ${productUkraineDetailEmptyTd('product-col-amount-cell product-ukraine-commission-rozetka-cell')}
-      ${productUkraineDetailEmptyTd('product-col-amount-cell product-ukraine-margin-prom-cell')}
-      ${productUkraineDetailEmptyTd('product-col-amount-cell product-ukraine-margin-rozetka-cell')}
-      ${deleteCell}
+    <tr class="product-ukraine-order-inner-row-tr${cancelledClass}" data-order-tx-id="${tx.id}" data-search="${escapeHtml(productSearchText(product))}">
+      <td class="product-ukraine-order-td product-ukraine-order-td--spacer" aria-hidden="true"></td>
+      <td class="product-ukraine-order-td product-ukraine-order-td--date">${orderTransactionDateCellHtml(tx)}</td>
+      <td class="product-ukraine-order-td product-ukraine-order-td--client" title="${escapeHtml(customer)}">
+        <span class="product-detail-readonly-value product-ukraine-order-client">${escapeHtml(customer)}</span>
+      </td>
+      <td class="product-ukraine-order-td product-ukraine-order-td--status" title="${escapeHtml(statusLabel)}">
+        ${renderOrderTransactionStatusBadge(statusLabel, { extraClass: 'product-ukraine-order-status' })}
+      </td>
+      <td class="product-ukraine-order-td product-ukraine-order-td--qty">
+        <span class="product-detail-readonly-value product-ukraine-order-qty">${escapeHtml(String(soldQty))}</span>
+      </td>
+      <td class="product-ukraine-order-td product-ukraine-order-td--money">
+        <span class="product-detail-readonly-value product-ukraine-order-price">${orderTransactionMoneyCompareHtml(orderTransactionApiUnitPrice(tx, product), catalogUnitPrice)}</span>
+      </td>
+      <td class="product-ukraine-order-td product-ukraine-order-td--money">
+        <span class="product-detail-readonly-value product-ukraine-order-sum">${orderTransactionMoneyCompareHtml(orderTransactionApiLineTotal(tx, product), catalogLineTotal)}</span>
+      </td>
+      <td class="product-ukraine-order-td product-ukraine-order-td--money">
+        <span class="product-detail-readonly-value product-ukraine-order-cost">${escapeHtml(costLabel)}</span>
+      </td>
+      <td class="product-ukraine-order-td product-ukraine-order-td--money">
+        <span class="product-detail-readonly-value product-ukraine-order-margin">${escapeHtml(marginLabel)}</span>
+      </td>
+    </tr>`
+}
+
+function productUkraineOrderTableRows(product, transactions, fifoCosts) {
+  const bodyRows = transactions.map((tx) => productUkraineOrderInnerRow(product, tx, fifoCosts)).join('')
+  return `
+    <tr class="task-detail-row product-detail-row product-ukraine-order-table-row-tr" data-product-id="${product.id}">
+      <td colspan="${productsTableColSpan()}" class="product-ukraine-order-table-cell">
+        <div class="product-ukraine-order-table-wrap">
+          <table class="product-ukraine-order-table">
+            <thead>
+              <tr>
+                <th class="product-ukraine-order-th product-ukraine-order-th--spacer" aria-hidden="true"></th>
+                <th class="product-ukraine-order-th product-ukraine-order-th--date">Дата</th>
+                <th class="product-ukraine-order-th product-ukraine-order-th--client">Клієнт</th>
+                <th class="product-ukraine-order-th product-ukraine-order-th--status">Статус</th>
+                <th class="product-ukraine-order-th product-ukraine-order-th--qty">К-ть</th>
+                <th class="product-ukraine-order-th product-ukraine-order-th--money">Ціна</th>
+                <th class="product-ukraine-order-th product-ukraine-order-th--money">Сума</th>
+                <th class="product-ukraine-order-th product-ukraine-order-th--money">Собіварт.</th>
+                <th class="product-ukraine-order-th product-ukraine-order-th--money">Маржа</th>
+              </tr>
+            </thead>
+            <tbody>${bodyRows}</tbody>
+          </table>
+        </div>
+      </td>
     </tr>`
 }
 
 function productUkraineOrderDetailRows(product) {
   const monthKey = resolveProductPagePeriodMonthKey()
   const fifoCosts = computeUkraineOrderTransactionFifoCosts(product)
-  const transactions = orderTransactionsForProductInMonth(product, monthKey)
+  const transactions = orderTransactionsSoldForProductInMonth(product, monthKey)
     .slice()
     .sort((a, b) => new Date(b.date || b.createdAt || 0).getTime() - new Date(a.date || a.createdAt || 0).getTime())
   if (!transactions.length) return ''
   return productUkraineOrderDetailHeaderRows()
-    + transactions.map((tx) => productDetailUkraineOrderRow(product, tx, fifoCosts)).join('')
+    + productUkraineOrderTableRows(product, transactions, fifoCosts)
 }
 
 function productUkraineReplenishmentDetailHeaderRows() {
@@ -8027,6 +10054,7 @@ function productUkraineCollapsedDisplay(product, field) {
 
 function productUkraineCollapsedCellInner(product, field) {
   if (field === 'stock') return productUkraineStockCellInner(product)
+  if (field === 'article') return productUkraineArticleCellInner(product)
   const text = productUkraineCollapsedDisplay(product, field)
   const indicator = productUkraineCollapsedCompareIndicator(product, field)
   if (!indicator) return escapeHtml(text || '—')
@@ -8036,8 +10064,12 @@ function productUkraineCollapsedCellInner(product, field) {
 
 function productUkraineReadOnlyCell(product, field, colClass) {
   const text = productUkraineCollapsedDisplay(product, field)
+  if (field === 'warehouse') {
+    const inner = marketplaceFieldWrap(text, text)
+    return productReadOnlyCell(inner, `${colClass} product-ukraine-read-cell product-ukraine-read-warehouse`, text, { html: true, emptyFallback: '—' })
+  }
   const inner = productUkraineCollapsedCellInner(product, field)
-  const hasHtml = inner.includes('<span')
+  const hasHtml = inner.includes('<span') || inner.includes('<div')
   return productReadOnlyCell(hasHtml ? inner : text, `${colClass} product-ukraine-read-cell product-ukraine-read-${field}`, text, { html: hasHtml, emptyFallback: '—' })
 }
 
@@ -8106,7 +10138,7 @@ function productUkraineDetailFieldsRow(product) {
     <tr class="task-detail-row product-detail-row product-detail-fields-row-tr product-ukraine-detail-row-tr" data-product-id="${product.id}" data-search="${escapeHtml(productSearchText(product))}">
       ${productDetailFieldTd('', 'num', 'product-num-cell')}
       ${productDetailFieldTd('<span class="product-detail-readonly-value product-ukraine-detail-spacer">&nbsp;</span>', 'name', 'product-col-name-cell product-ukraine-line-actions-cell')}
-      ${productDetailFieldTd(`<span class="product-detail-readonly-value product-ukraine-detail-article">${escapeHtml(productUkraineArticleLabel(product))}</span>`, 'sku', 'product-col-sku-cell product-ukraine-article-cell')}
+      ${productDetailFieldTd(productUkraineSkuStackInputs(product), 'sku', 'product-col-sku-cell product-ukraine-article-cell')}
       ${productDetailFieldTd(productUkraineStockCellInner(product), 'qty', 'product-col-qty-cell product-ukraine-stock-cell')}
       ${productDetailFieldTd(productUkraineWarehouseSelect(product), 'warehouse', 'product-warehouse-cell product-col-warehouse-cell product-ukraine-warehouse-cell')}
       ${productDetailFieldTd(productUkraineEditableAmountInput(product, 'priceProm', 'Ціна Prom'), 'money', 'product-col-amount-cell product-ukraine-price-prom-cell')}
@@ -8150,15 +10182,7 @@ function syncUkraineTableDynamicColumns() {
   const staticLastWidth = cols[staticLastIndex].classList.contains('product-delete-col')
     || cols[staticLastIndex].classList.contains('task-delete-col') ? 44 : 86
   const headerCells = table.querySelectorAll('thead tr:first-child th')
-  const rows = table.querySelectorAll([
-    'tbody tr.product-ukraine-row',
-    'tbody tr.product-ukraine-detail-row-tr',
-    'tbody tr.product-ukraine-replenishment-row-tr',
-    'tbody tr.product-ukraine-replenishment-label-row-tr',
-    'tbody tr.product-ukraine-order-row-tr',
-    'tbody tr.product-ukraine-order-label-row-tr',
-    'tbody tr.product-ukraine-order-header-row-tr',
-  ].join(', '))
+  const rows = table.querySelectorAll('tbody tr.product-ukraine-row')
   const wrap = table.closest('.table-wrap-wide')
   const wrapWidth = wrap?.clientWidth || 0
 
@@ -8291,8 +10315,7 @@ function syncProductUkraineDetailRow(productId, product) {
 
   const detailRow = document.querySelector(`tr.product-ukraine-detail-row-tr[data-product-id="${productId}"]`)
   if (detailRow) {
-    const articleValue = detailRow.querySelector('.product-ukraine-detail-article')
-    if (articleValue) articleValue.textContent = productUkraineArticleLabel(product)
+    syncProductUkraineSkuInputs(productId, product)
     const stockCell = detailRow.querySelector('.product-ukraine-stock-cell')
     if (stockCell) stockCell.innerHTML = productUkraineStockCellInner(product)
     const warehouseSelect = detailRow.querySelector('.product-ukraine-warehouse-select')
@@ -8305,7 +10328,9 @@ function syncProductUkraineDetailRow(productId, product) {
       if (input === document.activeElement) return
       const field = input.dataset.ukraineField
       if (!field) return
-      if (field === 'manualMarginProm' || field === 'manualMarginRozetka') {
+      if (field === 'name' || field === 'sku' || field === 'skuAlt') {
+        input.value = field === 'sku' ? productUkrainePrimarySkuValue(product) : (product[field] || '')
+      } else if (field === 'manualMarginProm' || field === 'manualMarginRozetka') {
         const marginField = field === 'manualMarginRozetka' ? 'marginRozetka' : 'marginProm'
         const resolved = marginField === 'marginRozetka'
           ? productUkraineMarginRozetka(product)
@@ -8335,9 +10360,10 @@ function syncProductUkraineOrderSection(productId, product) {
   if (!infoRow) return
   let prev = infoRow.previousElementSibling
   while (prev && (
-    prev.classList.contains('product-ukraine-order-row-tr')
+    prev.classList.contains('product-ukraine-order-header-row-tr')
+    || prev.classList.contains('product-ukraine-order-table-row-tr')
     || prev.classList.contains('product-ukraine-order-label-row-tr')
-    || prev.classList.contains('product-ukraine-order-header-row-tr')
+    || prev.classList.contains('product-ukraine-order-row-tr')
   )) {
     const toRemove = prev
     prev = prev.previousElementSibling
@@ -8405,6 +10431,22 @@ function syncManualStockZakupkaRow(productId, lineId, product, line) {
   syncManualStockZakupkaDetailRow(productId, lineId, viewProduct, line)
 }
 
+function syncProductUkraineSkuInputs(productId, product) {
+  if (!product) return
+  const detailRow = document.querySelector(`tr.product-ukraine-detail-row-tr[data-product-id="${productId}"]`)
+  if (!detailRow) return
+  detailRow.querySelectorAll('.product-ukraine-primary-sku-input').forEach((input) => {
+    if (input === document.activeElement) return
+    input.value = productUkrainePrimarySkuValue(product)
+    syncProductDetailControlSize(input)
+  })
+  detailRow.querySelectorAll('.product-ukraine-alt-sku-input').forEach((input) => {
+    if (input === document.activeElement) return
+    input.value = productUkraineAltSku(product)
+    syncProductDetailControlSize(input)
+  })
+}
+
 function syncProductUkraineRow(productId, product) {
   if (!product) return
   const row = document.querySelector(`tr.product-ukraine-row[data-product-id="${productId}"]`)
@@ -8415,13 +10457,17 @@ function syncProductUkraineRow(productId, product) {
   ;['article', 'stock', 'warehouse', 'priceProm', 'priceRozetka', 'cost', 'commissionProm', 'commissionRozetka', 'marginProm', 'marginRozetka'].forEach((field) => {
     const cell = row.querySelector(`.product-ukraine-read-${field}`)
     if (!cell) return
-    if (field === 'stock' || field === 'cost') {
+    if (field === 'stock' || field === 'cost' || field === 'article') {
       const inner = productUkraineCollapsedCellInner(product, field)
       if (inner.includes('<span')) {
         cell.innerHTML = inner
       } else {
         cell.textContent = productUkraineCollapsedDisplay(product, field)
       }
+      return
+    }
+    if (field === 'warehouse') {
+      cell.innerHTML = marketplaceFieldWrap(productUkraineWarehouseLabel(product), productUkraineWarehouseLabel(product))
       return
     }
     cell.textContent = productUkraineCollapsedDisplay(product, field)
@@ -8434,7 +10480,7 @@ function commitProductUkraineField(input) {
   const field = input.dataset.ukraineField
   if (!id || !field) return
   let value
-  if (field === 'name') {
+  if (field === 'name' || field === 'sku' || field === 'skuAlt') {
     value = String(input.value || '').trim()
   } else if (input.classList.contains('product-ukraine-percent-input')) {
     const raw = input.value
@@ -8459,6 +10505,10 @@ function commitProductUkraineField(input) {
   syncProductDetailControlSize(input)
   const updated = db.update('products', id, { [field]: value })
   if (updated) {
+    if (field === 'sku' || field === 'skuAlt') invalidateRenderCaches()
+    if (field === 'ukraineWarehouse') {
+      applyMarketplaceHighlight(input.closest('.marketplace-field-wrap'), value)
+    }
     syncProductUkraineRow(id, updated)
     if (field === 'ukraineWarehouse') syncWarehouseCapacityDisplays()
   }
@@ -9056,13 +11106,17 @@ function initProductTableDelegation() {
       return
     }
 
-    const expandBtn = e.target.closest('.task-title-toggle[data-product-expand]')
-    if (expandBtn) {
-      e.preventDefault()
-      const id = expandBtn.dataset.productExpand
-      expandedProductId = expandedProductId === id ? null : id
-      render()
-      return
+    const productToggleRow = e.target.closest('tr.product-zakupka-row, tr.product-ukraine-row')
+    if (productToggleRow && (isProductZakupkaCatalog() || isProductUkraineCatalog())) {
+      const onTitleToggle = e.target.closest('[data-product-expand]')
+      const onUkraineQty = isProductUkraineCatalog()
+        && e.target.closest('td.product-col-qty-cell, .product-ukraine-stock-qty')
+      if (onTitleToggle || onUkraineQty || !isProductRowInteractiveTarget(e.target)) {
+        e.preventDefault()
+        e.stopPropagation()
+        toggleProductRowExpand(resolveProductRowExpandId(productToggleRow))
+        return
+      }
     }
 
     const zakupkaDateCell = e.target.closest('.product-zakupka-row td.product-col-date-cell')
@@ -9071,15 +11125,17 @@ function initProductTableDelegation() {
       if (!field) return
       e.preventDefault()
       const row = zakupkaDateCell.closest('tr.product-zakupka-row')
-      const id = row?.dataset.productId
-      if (!id) return
-      if (expandedProductId === id) {
-        focusZakupkaDateInput(id, field)
+      const expandId = resolveProductRowExpandId(row)
+      const productId = row?.dataset.productId
+      const lineId = row?.dataset.manualStockLineId || ''
+      if (!expandId || !productId) return
+      if (expandedProductId === expandId) {
+        focusZakupkaDateInput(productId, field, { lineId })
         return
       }
-      expandedProductId = id
+      expandedProductId = expandId
       render()
-      requestAnimationFrame(() => focusZakupkaDateInput(id, field))
+      requestAnimationFrame(() => focusZakupkaDateInput(productId, field, { lineId }))
       return
     }
 
@@ -10259,7 +12315,7 @@ function getFinanceMonthDayKeys(monthKey) {
 }
 
 function buildFinanceMonthDailyChartData(data, monthKey) {
-  const pendingByDay = buildOrderTransactionsBeforeSaleByDay(monthKey)
+  const pendingByDay = buildOrderTransactionsInProcessingByDay(monthKey)
   return getFinanceMonthDayKeys(monthKey).map((key) => {
     const day = Number(key.split('-')[2]) || 0
     return {
@@ -11482,7 +13538,7 @@ function renderFinance() {
   const { income, expense, balance } = view
   const monthKey = resolveFinancePagePeriodMonthKey()
   const monthChartTitle = formatFinanceMonthLabel(monthKey)
-  const ordersInProcessingTotal = sumOrderTransactionsBeforeSale(monthKey)
+  const ordersInProcessingTotal = sumOrderTransactionsInProcessing(monthKey)
   const recent = getRecentFinanceTransactions(view, 3)
 
   return financePageWithExpenseModal(`
@@ -11511,6 +13567,7 @@ function renderFinance() {
     sparkValues: sparklineValuesFromTransactions(raw.expenseTx),
     sparkColor: '#a67c00',
     detailKey: 'expense',
+    extraRows: [{ label: 'Моя частка', value: fmtMoney(expense / 2), tone: 'expense' }],
   })}
             ${renderFinanceKpiCard({
     kind: 'overall',
@@ -12150,6 +14207,7 @@ function bindCrudEvents() {
       Object.assign(payload, db.getAuthorMeta())
       const item = db.create(collection, payload)
       logForCollection(collection, item)
+      window.BazarioAnim?.markRowCreated(item.id)
       form.reset()
       if (collection === 'shops') closeShopModal()
       if (collection === 'warehouses') closeWarehouseModal()
@@ -12172,9 +14230,17 @@ function bindCrudEvents() {
         return
       }
       if (collection === 'warehouses' && warehouseDetailId === id) warehouseDetailId = null
-      db.remove(collection, id)
-      showToast('Видалено')
-      render()
+      const row = btn.closest('tr')
+      const remove = () => {
+        db.remove(collection, id)
+        showToast('Видалено')
+        render()
+      }
+      if (window.BazarioAnim?.animateRowRemove) {
+        BazarioAnim.animateRowRemove(row, remove)
+      } else {
+        remove()
+      }
     })
   })
 
@@ -12752,55 +14818,89 @@ function closeAccountModal() {
 }
 
 function bindOrderShopModal() {
-  const form = document.getElementById('addOrderShopForm')
-  if (!form || form.dataset.orderShopBound === '1') return
-  form.dataset.orderShopBound = '1'
+  /* делегування — initOrderShopModalDelegation() */
+}
 
-  document.getElementById('addOrderShopBtn')?.addEventListener('click', openOrderShopModal)
-  document.getElementById('orderShopModalClose')?.addEventListener('click', closeOrderShopModal)
-  document.getElementById('orderShopModalCancel')?.addEventListener('click', closeOrderShopModal)
-  document.getElementById('orderShopModal')?.addEventListener('click', (e) => {
+function initOrderShopModalDelegation() {
+  const content = document.getElementById('content')
+  if (!content || content.dataset.orderShopModalDelegation === '1') return
+  content.dataset.orderShopModalDelegation = '1'
+
+  content.addEventListener('click', (e) => {
+    if (e.target.closest('#rozetkaSyncBtn')) {
+      e.preventDefault()
+      runRozetkaOrderSync().catch(() => {})
+      return
+    }
+    if (e.target.closest('#addOrderShopBtn')) {
+      e.preventDefault()
+      openOrderShopModal()
+      return
+    }
+    if (e.target.closest('#orderShopModalClose, #orderShopModalCancel')) {
+      e.preventDefault()
+      closeOrderShopModal()
+      return
+    }
     if (e.target.id === 'orderShopModal') closeOrderShopModal()
   })
 
-  form.addEventListener('submit', (e) => {
-      e.preventDefault()
-      const fd = new FormData(form)
-      const payload = orderTransactionPayloadFromForm(fd)
-      Object.assign(payload, db.getAuthorMeta())
-      db.create('orderTransactions', payload)
-      closeOrderShopModal()
-      showToast('Транзакцію додано')
-      syncUkraineProductsAfterOrderTransaction(payload)
-      syncNotificationsUI()
-      if (activeNav !== 'product' || !isProductUkraineCatalog()) render()
-    })
+  content.addEventListener('submit', (e) => {
+    const form = e.target.closest('#addOrderShopForm')
+    if (!form) return
+    e.preventDefault()
+    const fd = new FormData(form)
+    const payload = orderTransactionPayloadFromForm(fd)
+    Object.assign(payload, db.getAuthorMeta())
+    db.create('orderTransactions', payload)
+    closeOrderShopModal()
+    showToast('Транзакцію додано')
+    syncUkraineProductsAfterOrderTransaction(payload)
+    syncNotificationsUI()
+    if (activeNav !== 'product' || !isProductUkraineCatalog()) render()
+  })
 
-  form.addEventListener('input', (e) => {
-    if (e.target.matches('[name="qty"]')) syncBazarioOrderFormLineTotal(form)
+  content.addEventListener('input', (e) => {
+    const form = e.target.closest('#addOrderShopForm')
+    if (!form || !e.target.matches('[name="qty"]')) return
+    syncBazarioOrderFormLineTotal(form)
+  })
+
+  content.addEventListener('change', (e) => {
+    const deliverySelect = e.target.closest('#bazarioDelivery')
+    if (!deliverySelect) return
+    applyMarketplaceHighlight(deliverySelect, deliverySelect.value)
+    applyMarketplaceHighlight(deliverySelect.closest('.bazario-delivery-field'), deliverySelect.value)
   })
 }
 
 function bindBazarioOrderModal() {
-  bindOrderShopModal()
+  /* делегування — initOrderShopModalDelegation() */
+}
+
+function showAppModal(modal) {
+  if (!modal) return
+  modal.classList.remove('is-hidden', 'modal-anim', 'modal-anim--visible')
+  modal.setAttribute('aria-hidden', 'false')
+}
+
+function hideAppModal(modal) {
+  if (!modal) return
+  modal.classList.add('is-hidden')
+  modal.setAttribute('aria-hidden', 'true')
+  modal.classList.remove('modal-anim', 'modal-anim--visible')
 }
 
 function openOrderShopModal() {
   const modal = document.getElementById('orderShopModal')
   if (!modal) return
-  modal.classList.remove('is-hidden')
-  modal.setAttribute('aria-hidden', 'false')
+  showAppModal(modal)
   const form = document.getElementById('addOrderShopForm')
   const dateInput = form?.querySelector('[name="date"]')
   if (dateInput) dateInput.value = getLocalDateInputValue()
-  const firstNameInput = modal.querySelector('.order-product-suggest-input, [name="productName"]')
-  if (firstNameInput) {
-    requestAnimationFrame(() => {
-      firstNameInput.focus()
-      renderBazarioOrderProductSuggest(firstNameInput)
-      syncBazarioOrderFormLineTotal(document.getElementById('addOrderShopForm'))
-    })
-  }
+  syncBazarioOrderFormLineTotal(form)
+  const focusTarget = form?.querySelector('#bazarioFirstName, [name="firstName"]')
+  if (focusTarget) requestAnimationFrame(() => focusTarget.focus())
 }
 
 function openBazarioOrderModal() {
@@ -12810,11 +14910,10 @@ function openBazarioOrderModal() {
 function closeOrderShopModal() {
   const modal = document.getElementById('orderShopModal')
   if (!modal) return
-  modal.classList.add('is-hidden')
-  modal.setAttribute('aria-hidden', 'true')
   const firstNameInput = modal.querySelector('.order-product-suggest-input')
   if (firstNameInput) hideBazarioOrderProductSuggest(firstNameInput)
   document.getElementById('addOrderShopForm')?.reset()
+  hideAppModal(modal)
 }
 
 function closeBazarioOrderModal() {
@@ -12839,20 +14938,53 @@ function commitBazarioOrderPickSelect(select) {
   } else {
     patch = { [field]: val }
   }
+  const prevNotifyStatus = field === 'status' ? orderNotificationStatusKey(current) : null
   const updated = db.update('orderTransactions', id, patch)
   if (updated) {
+    if (field === 'delivery') {
+      const wrap = select.closest('.account-pick-wrap')
+      applyMarketplaceHighlight(wrap, val)
+      applyMarketplaceHighlight(select, val)
+      const valueEl = wrap?.querySelector('.account-pick-value')
+      if (valueEl) valueEl.textContent = getBazarioOrderPickDisplay(updated, field)
+    }
     const historyWrap = document.querySelector(`.order-tx-status-history-wrap[data-order-tx-id="${id}"]`)
     if (historyWrap) historyWrap.innerHTML = renderOrderTransactionStatusHistoryHtml(updated)
     syncUkraineProductsAfterOrderTransaction(current, updated)
-    if (field === 'status') syncNotificationsUI()
+    if (field === 'status') {
+      const statusValueEl = document.querySelector(
+        `.account-pick-cell[data-field="status"][data-order-tx-id="${id}"] .account-pick-value`,
+      )
+      if (statusValueEl) statusValueEl.innerHTML = renderOrderTransactionStatusCellHtml(updated)
+      syncNotificationsUI()
+    }
     if (activeNav !== 'product' || !isProductUkraineCatalog()) render()
   }
 }
 
-function commitBazarioOrderTtnCommentInput(input) {
+function commitBazarioOrderTtnCommentInput(input, { syncRemote = true } = {}) {
   const id = input.dataset.orderTxId
   if (!id) return
-  db.update('orderTransactions', id, { ttnComment: input.value.trim() })
+  db.update('orderTransactions', id, {
+    ttnComment: input.value.trim(),
+    ttnCommentManual: true,
+  })
+  if (syncRemote && window.BazarioSync?.isReady?.()) {
+    window.BazarioSync.syncNow?.().catch(() => {})
+  }
+}
+
+const bazarioOrderTtnInputTimers = new Map()
+
+function scheduleBazarioOrderTtnCommentInput(input) {
+  const id = input.dataset.orderTxId
+  if (!id) return
+  const prev = bazarioOrderTtnInputTimers.get(id)
+  if (prev) window.clearTimeout(prev)
+  bazarioOrderTtnInputTimers.set(id, window.setTimeout(() => {
+    bazarioOrderTtnInputTimers.delete(id)
+    commitBazarioOrderTtnCommentInput(input, { syncRemote: false })
+  }, 400))
 }
 
 function commitBazarioOrderClientCommentInput(input) {
@@ -12982,6 +15114,12 @@ function initBazarioOrderDelegation() {
     if (e.target.closest('.order-product-suggest-menu')) e.preventDefault()
   })
 
+  content.addEventListener('input', (e) => {
+    if (activeNav !== 'accounting' || !isOrderShopAccountingPage()) return
+    const input = e.target.closest('.bazario-order-ttn-input')
+    if (input) scheduleBazarioOrderTtnCommentInput(input)
+  })
+
   content.addEventListener('blur', (e) => {
     if (activeNav !== 'accounting' || !isOrderShopAccountingPage()) return
     const suggestInput = e.target.closest('.order-product-suggest-input')
@@ -12991,6 +15129,12 @@ function initBazarioOrderDelegation() {
     }
     const input = e.target.closest('.bazario-order-ttn-input')
     if (input) {
+      const id = input.dataset.orderTxId
+      const pending = id && bazarioOrderTtnInputTimers.get(id)
+      if (pending) {
+        window.clearTimeout(pending)
+        bazarioOrderTtnInputTimers.delete(id)
+      }
       commitBazarioOrderTtnCommentInput(input)
       return
     }
@@ -13355,9 +15499,11 @@ function applySearchFilter() {
     const text = (row.dataset.search || '').toLowerCase()
     row.style.display = !q || text.includes(q) ? '' : 'none'
   })
+  const tableWrap = document.querySelector('#content .table-wrap')
+  if (q && tableWrap) window.BazarioAnim?.applySearchRowFade(tableWrap)
 }
 
-function renderContent() {
+function renderContentInner() {
   const el = document.getElementById('content')
   if (activeNav === 'warehouse' && warehouseModalOpen) {
     warehouseModalDraft = readWarehouseModalDraft()
@@ -13394,6 +15540,17 @@ function renderContent() {
   if (activeNav === 'advertising') {
     bindAdvertisingPage()
   }
+  window.__bazarioActiveNav = activeNav
+  window.BazarioAnim?.afterPageRender(el)
+}
+
+function renderContent() {
+  const el = document.getElementById('content')
+  if (window.BazarioAnim) {
+    BazarioAnim.runPageTransition(el, () => renderContentInner())
+  } else {
+    renderContentInner()
+  }
 }
 
 function buildNavButtonsHtml() {
@@ -13406,14 +15563,16 @@ function buildNavButtonsHtml() {
 
 function playNavSelectAnimation(btn) {
   if (!btn || window.matchMedia('(prefers-reduced-motion: reduce)').matches) return
+  const icon = btn.querySelector('svg')
+  if (!icon) return
   btn.classList.remove('nav-btn-pop')
-  void btn.offsetWidth
+  void icon.offsetWidth
   btn.classList.add('nav-btn-pop')
   const onEnd = () => {
     btn.classList.remove('nav-btn-pop')
-    btn.removeEventListener('animationend', onEnd)
+    icon.removeEventListener('animationend', onEnd)
   }
-  btn.addEventListener('animationend', onEnd)
+  icon.addEventListener('animationend', onEnd)
 }
 
 function applyNavActiveState({ animate = false } = {}) {
@@ -13425,6 +15584,7 @@ function applyNavActiveState({ animate = false } = {}) {
     btn.setAttribute('aria-current', isActive ? 'page' : 'false')
     if (isActive && animate) playNavSelectAnimation(btn)
   })
+  window.BazarioAnim?.moveNavIndicator?.({ pulse: animate })
 }
 
 function resetNavSectionContext() {
@@ -13477,6 +15637,7 @@ function initNavMain() {
       searchInput.placeholder = SEARCH_PLACEHOLDERS[activeNav]
     }
     applyNavActiveState({ animate: true })
+    window.BazarioAnim?.markPageTransition()
     render()
     persistAppNavState()
   })
@@ -13491,6 +15652,7 @@ function renderNav({ animate = false } = {}) {
 
 function render() {
   financePageDataPassCache = null
+  invalidateRenderCaches()
   syncCurrentUserRoleFromProfileRecord()
   syncHeader()
   renderContent()
@@ -13501,6 +15663,8 @@ syncHeader()
 initAccountTableDelegation()
 initProductTableDelegation()
 initTaskTableDelegation()
+initBazarioOrderDelegation()
+initOrderShopModalDelegation()
 initNotifications()
 initHomeTaskLinks()
 initAccountingNavLinks()
@@ -13535,20 +15699,74 @@ function scheduleRemoteRender() {
   clearTimeout(remoteRenderTimer)
   remoteRenderTimer = setTimeout(() => {
     remoteRenderTimer = null
+    ensureRozetkaOrderTransactionsConsolidated()
     syncHeader()
     render()
   }, 450)
 }
 
+if (window.BazarioRozetkaSync) {
+  const deferRozetkaInitialSync = Boolean(window.BazarioSync?.isEnabled?.())
+  BazarioRozetkaSync.init({
+    deferInitialSync: deferRozetkaInitialSync,
+    onPurge: (purge) => {
+      if (!purge?.removed) return
+      applyRozetkaSyncResult({
+        created: 0,
+        updated: 0,
+        changed: purge.transactions || [],
+      }, { silent: true })
+    },
+    onSyncComplete: (result, options = {}) => {
+      applyRozetkaSyncResult(result, options)
+    },
+  })
+
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState !== 'visible') return
+    if (!BazarioRozetkaSync.isEnabled?.()) return
+    BazarioRozetkaSync.syncOrders({ silent: true }).catch(() => {})
+  })
+}
+
+if (window.BazarioTelegramSync) {
+  refreshTelegramUserServerStatus()
+  BazarioTelegramSync.init({
+    onSyncComplete: (result, options = {}) => {
+      applyTelegramSyncResult(result, options)
+    },
+  })
+
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState !== 'visible') return
+    if (!BazarioTelegramSync.isEnabled?.()) return
+    BazarioTelegramSync.pollOnce({ silent: true }).then((result) => {
+      applyTelegramSyncResult(result, { silent: true })
+    }).catch(() => {})
+  })
+}
+
 function startApp() {
+  window.openTelegramNotification = openTelegramNotification
+  window.goToOrderFromNotification = goToOrderFromNotification
+  window.goToTaskFromNotification = goToTaskFromNotification
+  window.BazarioDeviceNotifications?.init?.()
   render()
 }
 
 startApp()
 
+BazarioAnim.init()
+initNotificationDateWatch()
+
 if (window.BazarioSync?.isEnabled()) {
   BazarioSync.init({
-    onReady: startApp,
+    onReady: () => {
+      BazarioRozetkaSync?.runInitialSyncIfDeferred?.()
+      startApp()
+    },
     onRemoteChange: scheduleRemoteRender,
   })
+} else {
+  BazarioRozetkaSync?.runInitialSyncIfDeferred?.()
 }

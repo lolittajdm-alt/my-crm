@@ -4,3 +4,7 @@ dist/
 *.local
 .env
 .env.*
+standalone/rozetka-config.js
+standalone/telegram-config.js
+telegram-user.local.json
+telegram-login-qr.png

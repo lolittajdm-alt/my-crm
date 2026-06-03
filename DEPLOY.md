@@ -1,63 +1,138 @@
-# Деплой MY CRM онлайн (GitHub Pages)
+# Деплой MY CRM онлайн (Telegram + Rozetka + API)
 
-## 1. Створіть репозиторій на GitHub
+GitHub Pages — **только статика**, без Node. Для всех API нужен **облачный сервер**.
 
-1. [github.com/new](https://github.com/new)
-2. **Repository name:** `my-crm` (або будь-яка назва)
-3. **Public**
-4. **Не** додавайте README / .gitignore (репо порожній)
-5. **Create repository**
+## Рекомендуется: всё на Render (один URL)
 
-## 2. Завантажте код (один раз у терміналі)
+CRM, Rozetka-прокси, Telegram Bot и Telegram User API работают как на `./start.sh`.
 
-```bash
-cd /Users/vladcabanuk/Desktop/Dashboard
-git init
-git branch -M main
-git add .
-git commit -m "MY CRM — standalone + GitHub Pages deploy"
-git remote add origin https://github.com/ВАШ_ЛОГІН/my-crm.git
-git push -u origin main
-```
+### 1. Репозиторий на GitHub
 
-Замініть `ВАШ_ЛОГІН` і `my-crm` на свої.
-
-## 3. Увімкніть GitHub Pages
-
-1. GitHub → ваш репозиторій → **Settings**
-2. **Pages** (ліворуч)
-3. **Build and deployment** → Source: **Deploy from a branch**
-4. **Branch:** `gh-pages` → **`/ (root)`** → **Save**
-
-> Після першого push GitHub Actions створить гілку `gh-pages` (1–2 хв).
-> Якщо її ще немає — зачекайте зеленого deploy у **Actions**, потім оновіть Settings → Pages.
-
-## 4. Ваш сайт
-
-```
-https://ВАШ_ЛОГІН.github.io/my-crm/
-```
-
-## 5. Supabase
-
-**Authentication** → **URL Configuration**:
-
-- **Site URL:** `https://ВАШ_ЛОГІН.github.io/my-crm/`
-- **Redirect URLs:**
-  ```
-  https://ВАШ_ЛОГІН.github.io/my-crm/**
-  http://localhost:8080/**
-  ```
-
-## Оновлення сайту
-
-Після змін у коді:
+У вас уже есть: `https://github.com/lolittajdm-alt/my-crm`
 
 ```bash
-cd /Users/vladcabanuk/Desktop/Dashboard
+cd ~/Desktop/Dashboard
 git add .
-git commit -m "update"
-git push
+git commit -m "Cloud deploy: Render + API"
+git push origin main
 ```
 
-GitHub Actions автоматично оновить сайт.
+### 2. Render.com
+
+1. [render.com](https://render.com) → **Sign Up** (через GitHub)
+2. **New** → **Blueprint** → подключите репозиторий `my-crm`
+3. Render прочитает `render.yaml` и создаст сервис **my-crm**
+4. В **Environment** добавьте секреты:
+
+| Переменная | Значение |
+|------------|----------|
+| `TELEGRAM_API_ID` | из [my.telegram.org/apps](https://my.telegram.org/apps) |
+| `TELEGRAM_API_HASH` | там же |
+| `TELEGRAM_SESSION` | строка `session` из `telegram-user.local.json` |
+| `TELEGRAM_CHAT_IDS` | `["-5051169703"]` |
+| `TELEGRAM_MODE` | `user` |
+| `ROZETKA_API_TOKEN` | токен Rozetka (или логин/пароль ниже) |
+| `ROZETKA_USERNAME` | если без токена |
+| `ROZETKA_PASSWORD` | если без токена |
+
+`BAZARIO_API_KEY` Render создаст сам — **скопируйте** его (нужен для варианта B).
+
+5. **Deploy** → через 2–3 мин сайт:
+
+```
+https://my-crm-xxxx.onrender.com
+```
+
+6. Откройте URL на Mac и iPhone → включите уведомления в колокольчике.
+
+### 3. Telegram session для облака
+
+Сессию получаете **локально один раз**:
+
+```bash
+node tools/telegram-user-auth.mjs
+```
+
+Скопируйте `"session": "..."` из `telegram-user.local.json` → в Render → `TELEGRAM_SESSION`.
+
+> На бесплатном Render сервер «засыпает» после 15 мин без запросов. Первый заход может занять ~30 сек.
+
+---
+
+## Вариант B: GitHub Pages + Render API
+
+Фронт на Pages, API на Render (два URL).
+
+### 1. API на Render
+
+Как выше, но можно назвать сервис `my-crm-api`.
+
+### 2. Связать фронт с API
+
+В `standalone/api-origin.js`:
+
+```javascript
+window.BAZARIO_API_ORIGIN = 'https://my-crm-xxxx.onrender.com'
+window.BAZARIO_API_KEY = 'ключ_из_Render_BAZARIO_API_KEY'
+```
+
+Закоммитьте и включите GitHub Pages (ветка `gh-pages`).
+
+### 3. URLs
+
+- CRM: `https://lolittajdm-alt.github.io/my-crm/`
+- API: `https://my-crm-xxxx.onrender.com/api/health`
+
+---
+
+## Что работает онлайн
+
+| Функция | Render (вариант A) | Pages + API (вариант B) |
+|---------|-------------------|-------------------------|
+| CRM интерфейс | ✅ | ✅ |
+| Rozetka `/api/rozetka` | ✅ | ✅ |
+| Telegram Bot `/api/telegram` | ✅ | ✅ |
+| Telegram User (группы без админа) | ✅ | ✅ |
+| Push на iPhone | ✅ | ✅ |
+| Supabase | ✅*, настройте URL в Supabase | ✅ |
+
+\* `standalone/supabase-config.js` — добавьте в репозиторий или через env (см. ниже).
+
+---
+
+## Supabase
+
+**Authentication → URL Configuration**:
+
+- **Site URL:** ваш URL CRM (Render или GitHub Pages)
+- **Redirect URLs:** `https://ваш-url/**` и `http://localhost:8080/**`
+
+---
+
+## Локальная разработка
+
+```bash
+./start.sh
+# http://localhost:8080
+```
+
+`api-origin.js` с пустым `BAZARIO_API_ORIGIN` — API на том же хосте, ключ не нужен.
+
+---
+
+## Проверка API
+
+```bash
+curl https://my-crm-xxxx.onrender.com/api/health
+curl -H "X-Bazario-Api-Key: YOUR_KEY" https://my-crm-xxxx.onrender.com/api/telegram-user/status
+```
+
+---
+
+## Обновление
+
+```bash
+git push origin main
+```
+
+Render и GitHub Actions обновятся автоматически.
