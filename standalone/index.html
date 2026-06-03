@@ -13,19 +13,24 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="styles.css?v=339" />
+  <link rel="stylesheet" href="styles.css?v=340" />
 </head>
 <body>
   <div class="shell">
+    <div class="mobile-nav-backdrop is-hidden" id="mobileNavBackdrop" aria-hidden="true"></div>
     <div class="app">
       <aside class="sidebar" aria-label="Навігація">
+        <div class="mobile-nav-head">
+          <span class="mobile-nav-title">MY CRM</span>
+          <button type="button" class="mobile-nav-close" id="mobileNavClose" aria-label="Закрити меню">×</button>
+        </div>
         <nav class="nav-main" id="nav"></nav>
       </aside>
 
       <main class="main">
         <header class="header">
           <div class="brand">
-            <div class="logo" aria-hidden="true">M</div>
+            <button type="button" class="logo mobile-nav-toggle" id="mobileNavToggle" aria-label="Відкрити меню" aria-expanded="false" aria-controls="nav">M</button>
             <div class="brand-text">
               <p class="brand-name" id="brandName">MY CRM</p>
               <p class="brand-user" id="brandUser">Чабанюк Владислав</p>
@@ -116,6 +121,6 @@
   <script src="telegram-sync.js?v=3"></script>
   <script src="device-notifications.js?v=2"></script>
   <script src="animations.js?v=6"></script>
-  <script src="app.js?v=417"></script>
+  <script src="app.js?v=418"></script>
 </body>
 </html>
