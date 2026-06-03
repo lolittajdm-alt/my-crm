@@ -7908,23 +7908,413 @@ button.finance-dash-card.finance-dash-card--clickable {
 }
 
 @media (max-width: 768px) {
-  .shell { padding: 8px; }
-  .app { flex-direction: column; padding: 16px; }
-  .row-top { grid-template-columns: 1fr; }
-  .row-top > *:last-child { grid-column: auto; }
-  .search { max-width: none; min-width: 0; }
-  .form-grid { grid-template-columns: 1fr; }
+  html, body {
+    height: 100%;
+    overflow: hidden;
+  }
+
+  .shell {
+    padding: 0;
+    height: 100dvh;
+    height: 100vh;
+  }
+
+  .app {
+    flex-direction: column;
+    width: 100%;
+    max-width: none;
+    height: 100dvh;
+    height: 100vh;
+    max-height: 100dvh;
+    max-height: 100vh;
+    border-radius: 0;
+    padding: 10px 10px 0;
+    gap: 10px;
+    box-shadow: none;
+  }
+
+  /* Нижня навігація */
+  .sidebar {
+    order: 2;
+    width: 100%;
+    flex-shrink: 0;
+    padding: 6px 8px;
+    padding-bottom: max(8px, env(safe-area-inset-bottom));
+    border-radius: 18px 18px 0 0;
+    height: auto;
+  }
+
+  .nav-main {
+    flex-direction: row;
+    justify-content: flex-start;
+    gap: 2px;
+    overflow-x: auto;
+    overflow-y: hidden;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+  }
+
+  .nav-main::-webkit-scrollbar {
+    display: none;
+  }
+
+  .nav-btn {
+    --nav-slot: 46px;
+    --nav-ring-size: 38px;
+    flex-shrink: 0;
+  }
+
+  .main {
+    order: 1;
+    flex: 1;
+    min-height: 0;
+    gap: 12px;
+  }
+
+  /* Шапка */
+  .header {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 8px;
+  }
+
+  .brand {
+    min-width: 0;
+    gap: 10px;
+  }
+
+  .brand-text {
+    min-width: 0;
+    overflow: hidden;
+  }
+
+  .brand-name,
+  .brand-user {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .logo {
+    width: 40px;
+    height: 40px;
+    font-size: 18px;
+    border-radius: 12px;
+  }
+
+  .brand-name {
+    font-size: 16px;
+  }
+
+  .brand-user {
+    font-size: 12px;
+  }
+
+  .header-tools {
+    width: 100%;
+    max-width: none;
+    margin-left: 0;
+    gap: 8px;
+  }
+
+  .search {
+    max-width: none;
+    min-width: 0;
+    flex: 1;
+    height: 42px;
+    padding: 0 14px;
+  }
+
+  .search input {
+    font-size: 16px;
+  }
+
+  .notifications-btn {
+    width: 42px;
+    height: 42px;
+    flex-shrink: 0;
+  }
+
+  /* Контент і картки */
+  .content {
+    gap: 14px;
+  }
+
+  .row-top {
+    grid-template-columns: 1fr;
+  }
+
+  .row-top > *:last-child {
+    grid-column: auto;
+  }
+
+  .card {
+    padding: 16px;
+    border-radius: 18px;
+  }
+
+  .card-head {
+    margin-bottom: 14px;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+
+  .card-head h2 {
+    font-size: 14px;
+  }
+
+  .greeting-title {
+    font-size: clamp(22px, 6.5vw, 30px);
+  }
+
+  .home-greeting {
+    gap: 12px;
+  }
+
+  .page-title {
+    font-size: clamp(18px, 5vw, 22px);
+  }
+
+  .page-sub {
+    font-size: 13px;
+  }
+
+  .page-header-row {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 10px;
+  }
+
+  .page-header-row .btn-primary,
+  .product-page-add-actions {
+    width: 100%;
+    margin-top: 0;
+    justify-content: stretch;
+  }
+
+  .page-header-row .btn-primary {
+    text-align: center;
+  }
+
+  .form-grid {
+    grid-template-columns: 1fr;
+  }
+
   .panel-page,
   .profile-page,
   .tasks-page,
-  .accounts-page { width: 100%; max-width: none; padding: 20px 16px; }
+  .accounts-page {
+    width: 100%;
+    max-width: none;
+    padding: 16px 12px;
+  }
+
   .profile-row,
   .profile-form-row {
     grid-template-columns: 1fr;
     gap: 8px;
-    padding: 16px 20px;
+    padding: 14px 16px;
   }
-  .profile-header { flex-direction: column; text-align: center; }
+
+  .profile-header {
+    flex-direction: column;
+    text-align: center;
+  }
+
+  /* Таблиці — горизонтальний скрол, читабельний шрифт */
+  .table-wrap,
+  .table-wrap-wide {
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .data-table th,
+  .data-table td {
+    font-size: 13px;
+    padding: 10px 8px;
+  }
+
+  .bazario-orders-table-card .table-wrap-wide {
+    overflow-x: auto;
+    overflow-y: auto;
+    max-height: min(58dvh, calc(100dvh - 220px));
+  }
+
+  .bazario-orders-table-card .bazario-orders-data-table {
+    font-size: 12px;
+    line-height: 1.35;
+    min-width: 680px;
+  }
+
+  .bazario-orders-table-card .bazario-orders-data-table th,
+  .bazario-orders-table-card .bazario-orders-data-table td {
+    padding: 8px 6px;
+  }
+
+  .products-table-card .table-wrap-wide,
+  .tasks-table-card .table-wrap-wide,
+  .accounts-table-card .table-wrap-wide {
+    overflow-x: auto;
+  }
+
+  .products-table-card.products-catalog-mode-ukraine .products-data-table {
+    min-width: 640px;
+    font-size: 12px;
+  }
+
+  .bazario-accounting-head-row {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 12px;
+  }
+
+  .bazario-accounting-actions,
+  .bazario-accounting-actions--sync {
+    width: 100%;
+    justify-content: stretch;
+  }
+
+  .order-shop-title-row {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .page-period-title,
+  .order-shop-block-title {
+    font-size: clamp(18px, 5vw, 22px);
+  }
+
+  /* Сповіщення — bottom sheet */
+  .notifications-panel {
+    position: fixed;
+    top: auto;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    width: 100%;
+    max-width: none;
+    max-height: min(78dvh, 85vh);
+    border-radius: 20px 20px 0 0;
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+
+  .notifications-item-title {
+    font-size: 15px;
+  }
+
+  .notifications-item-meta,
+  .notifications-item-time {
+    font-size: 13px;
+  }
+
+  .order-push-stack {
+    width: min(100%, calc(100vw - 24px));
+    right: 0;
+  }
+
+  /* Модалки */
+  .modal-overlay {
+    padding: 0;
+    align-items: flex-end;
+  }
+
+  .modal {
+    max-width: 100%;
+    max-height: 92dvh;
+    border-radius: 20px 20px 0 0;
+    padding: 20px 16px;
+    padding-bottom: max(20px, env(safe-area-inset-bottom));
+  }
+
+  .modal--wide {
+    max-width: 100%;
+  }
+
+  .telegram-message-modal {
+    max-height: 88dvh;
+  }
+
+  .telegram-message-modal-text {
+    font-size: 15px;
+    line-height: 1.5;
+  }
+
+  /* Toast і вихід */
+  .toast {
+    left: 12px;
+    right: 12px;
+    bottom: max(76px, calc(env(safe-area-inset-bottom) + 68px));
+    text-align: center;
+    font-size: 13px;
+  }
+
+  .auth-logout {
+    right: 12px;
+    bottom: max(68px, calc(env(safe-area-inset-bottom) + 60px));
+    z-index: 40;
+  }
+
+  .storage-hint {
+    font-size: 10px;
+    padding: 4px 8px 6px;
+    line-height: 1.35;
+  }
+
+  .btn-primary,
+  .btn-secondary,
+  .btn-link {
+    min-height: 44px;
+  }
+
+  .auth-overlay {
+    padding: 16px;
+    padding-bottom: max(16px, env(safe-area-inset-bottom));
+  }
+
+  .auth-card {
+    padding: 22px 20px 20px;
+  }
+
+  .auth-title {
+    font-size: 22px;
+  }
+
+  .finance-kpi-row,
+  .finance-month-grid,
+  .accounting-summary-row {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 480px) {
+  .app {
+    padding: 8px 8px 0;
+  }
+
+  .brand-user {
+    display: none;
+  }
+
+  .home-greeting .team {
+    display: none;
+  }
+
+  .card {
+    padding: 14px;
+  }
+
+  .bazario-orders-table-card .bazario-orders-data-table {
+    min-width: 620px;
+    font-size: 11px;
+  }
+
+  .notifications-panel-head {
+    padding: 12px 14px 8px;
+  }
+
+  .notifications-section-title {
+    font-size: 10px;
+  }
 }
 
 .auth-overlay {
