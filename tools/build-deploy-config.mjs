@@ -8,7 +8,12 @@ import { writeFile } from 'fs/promises'
 const root = new URL('../standalone/', import.meta.url)
 
 function escJs(value) {
-  return String(value ?? '').replace(/\\/g, '\\\\').replace(/'/g, "\\'")
+  return String(value ?? '')
+    .trim()
+    .replace(/\\/g, '\\\\')
+    .replace(/'/g, "\\'")
+    .replace(/\r/g, '\\r')
+    .replace(/\n/g, '\\n')
 }
 
 async function writeApiOrigin() {

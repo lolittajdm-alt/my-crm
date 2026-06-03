@@ -5,6 +5,7 @@ services:
     name: my-crm
     runtime: node
     plan: free
+    autoDeploy: true
     buildCommand: npm install && node tools/build-deploy-config.mjs
     startCommand: npm start
     healthCheckPath: /api/health
