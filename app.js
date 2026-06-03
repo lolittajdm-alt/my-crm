@@ -310,7 +310,7 @@ const TASK_MAX_ATTACHMENTS = 10
 const TASK_MAX_FILE_BYTES = 2 * 1024 * 1024
 
 function savedToastMessage() {
-  return window.BazarioSync?.isReady?.() ? 'Збережено · синхронізація щогодини' : 'Збережено локально'
+  return window.BazarioSync?.isReady?.() ? 'Збережено · синхронізація онлайн' : 'Збережено локально'
 }
 
 function showToast(message) {
@@ -15557,6 +15557,7 @@ function buildNavButtonsHtml() {
   return NAV.map((item) => `
     <button type="button" class="nav-btn${activeNav === item.id ? ' active' : ''}" data-nav="${item.id}" title="${item.label}" aria-label="${item.label}" aria-current="${activeNav === item.id ? 'page' : 'false'}">
       ${ICONS[item.icon]}
+      <span class="nav-label">${escapeHtml(item.label)}</span>
     </button>
   `).join('')
 }
@@ -15617,6 +15618,58 @@ function resetNavSectionContext() {
   resetProductsUkraineTableControls()
   productCatalogPickerOpen = false
   closeNotificationsPanel()
+}
+
+function initMobileNav() {
+  const toggle = document.getElementById('mobileNavToggle')
+  const closeBtn = document.getElementById('mobileNavClose')
+  const sidebar = document.querySelector('.sidebar')
+  const backdrop = document.getElementById('mobileNavBackdrop')
+  const nav = document.getElementById('nav')
+  if (!toggle || !sidebar || !backdrop || toggle.dataset.bound === '1') return
+  toggle.dataset.bound = '1'
+
+  const mq = window.matchMedia('(max-width: 768px)')
+
+  const close = () => {
+    sidebar.classList.remove('is-open')
+    backdrop.classList.remove('is-visible')
+    backdrop.classList.add('is-hidden')
+    backdrop.setAttribute('aria-hidden', 'true')
+    toggle.setAttribute('aria-expanded', 'false')
+    document.body.classList.remove('mobile-nav-open')
+  }
+
+  const open = () => {
+    if (!mq.matches) return
+    sidebar.classList.add('is-open')
+    backdrop.classList.remove('is-hidden')
+    backdrop.classList.add('is-visible')
+    backdrop.setAttribute('aria-hidden', 'false')
+    toggle.setAttribute('aria-expanded', 'true')
+    document.body.classList.add('mobile-nav-open')
+    window.BazarioAnim?.moveNavIndicator?.()
+  }
+
+  toggle.addEventListener('click', () => {
+    if (!mq.matches) return
+    if (sidebar.classList.contains('is-open')) close()
+    else open()
+  })
+
+  closeBtn?.addEventListener('click', close)
+  backdrop.addEventListener('click', close)
+  nav?.addEventListener('click', (e) => {
+    if (e.target.closest('[data-nav]')) close()
+  })
+
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && sidebar.classList.contains('is-open')) close()
+  })
+
+  mq.addEventListener('change', (e) => {
+    if (!e.matches) close()
+  })
 }
 
 function initNavMain() {
@@ -15751,6 +15804,7 @@ function startApp() {
   window.goToOrderFromNotification = goToOrderFromNotification
   window.goToTaskFromNotification = goToTaskFromNotification
   window.BazarioDeviceNotifications?.init?.()
+  initMobileNav()
   render()
 }
 
