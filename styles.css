@@ -184,30 +184,6 @@ ul { list-style: none; }
   display: flex; align-items: center; justify-content: center;
   color: #fff; font-weight: 700; font-size: 20px; flex-shrink: 0;
 }
-
-button.logo.mobile-nav-toggle {
-  border: none;
-  padding: 0;
-  font-family: inherit;
-  cursor: pointer;
-  -webkit-tap-highlight-color: transparent;
-}
-
-button.logo.mobile-nav-toggle:active {
-  transform: scale(0.96);
-}
-
-.nav-label {
-  display: none;
-}
-
-.mobile-nav-head {
-  display: none;
-}
-
-.mobile-nav-backdrop {
-  display: none;
-}
 .brand-name { font-size: 18px; font-weight: 700; letter-spacing: -.01em; }
 .brand-user { font-size: 13px; color: var(--text-secondary); margin-top: 2px; }
 .search {
@@ -7952,183 +7928,90 @@ button.finance-dash-card.finance-dash-card--clickable {
     max-height: 100dvh;
     max-height: 100vh;
     border-radius: 0;
-    padding: 0;
-    gap: 0;
+    padding: 10px 10px 0;
+    gap: 10px;
     box-shadow: none;
   }
 
-  .mobile-nav-backdrop {
-    display: block;
-    position: fixed;
-    inset: 0;
-    z-index: 1900;
-    background: rgba(15, 20, 30, 0.48);
-    opacity: 0;
-    pointer-events: none;
-    transition: opacity 0.24s ease;
-  }
-
-  .mobile-nav-backdrop.is-visible {
-    opacity: 1;
-    pointer-events: auto;
-  }
-
-  .mobile-nav-backdrop.is-hidden {
-    display: block;
-    opacity: 0;
-    pointer-events: none;
-  }
-
-  /* Бокове меню зліва */
+  /* Нижня навігація */
   .sidebar {
-    position: fixed;
-    left: 0;
-    top: 0;
-    bottom: 0;
-    z-index: 2000;
-    width: min(292px, 88vw);
-    height: auto;
-    max-height: none;
-    padding: 0;
-    border-radius: 0 22px 22px 0;
-    transform: translateX(-105%);
-    transition: transform 0.28s cubic-bezier(0.33, 1, 0.68, 1);
-    box-shadow: 12px 0 48px rgba(0, 0, 0, 0.28);
-    flex-direction: column;
-    align-items: stretch;
-  }
-
-  .sidebar.is-open {
-    transform: translateX(0);
-  }
-
-  .mobile-nav-head {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 12px;
-    padding: max(14px, env(safe-area-inset-top)) 16px 12px;
-    border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+    order: 2;
+    width: 100%;
     flex-shrink: 0;
-  }
-
-  .mobile-nav-title {
-    font-size: 17px;
-    font-weight: 700;
-    color: #fff;
-    letter-spacing: -0.01em;
-  }
-
-  .mobile-nav-close {
-    width: 36px;
-    height: 36px;
-    border-radius: 12px;
-    color: rgba(255, 255, 255, 0.75);
-    font-size: 24px;
-    line-height: 1;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    background: rgba(255, 255, 255, 0.08);
+    padding: 6px 8px;
+    padding-bottom: max(8px, env(safe-area-inset-bottom));
+    border-radius: 18px 18px 0 0;
+    height: auto;
   }
 
   .nav-main {
-    flex-direction: column;
-    align-items: stretch;
+    flex-direction: row;
     justify-content: flex-start;
-    gap: 4px;
-    overflow-x: hidden;
-    overflow-y: auto;
+    gap: 2px;
+    overflow-x: auto;
+    overflow-y: hidden;
     -webkit-overflow-scrolling: touch;
-    padding: 10px 10px max(16px, env(safe-area-inset-bottom));
-    flex: 1;
-    min-height: 0;
+    scrollbar-width: none;
+  }
+
+  .nav-main::-webkit-scrollbar {
+    display: none;
   }
 
   .nav-btn {
-    --nav-slot: auto;
+    --nav-slot: 46px;
     --nav-ring-size: 38px;
-    width: 100%;
-    height: auto;
-    min-height: 48px;
-    border-radius: 14px;
-    justify-content: flex-start;
-    padding: 10px 14px;
-    gap: 12px;
     flex-shrink: 0;
-  }
-
-  .nav-btn::before {
-    display: none;
-  }
-
-  .nav-btn svg {
-    flex-shrink: 0;
-    width: 22px;
-    height: 22px;
-  }
-
-  .nav-label {
-    display: inline;
-    font-size: 15px;
-    font-weight: 600;
-    color: rgba(255, 255, 255, 0.82);
-    line-height: 1.2;
-  }
-
-  .nav-btn.active {
-    background: rgba(141, 163, 207, 0.22);
-    color: #fff;
-  }
-
-  .nav-btn.active .nav-label {
-    color: #fff;
-  }
-
-  .nav-active-indicator {
-    display: none !important;
   }
 
   .main {
+    order: 1;
     flex: 1;
     min-height: 0;
-    gap: 0;
-    width: 100%;
-    padding: 0 10px;
+    gap: 12px;
   }
 
-  /* Компактна шапка: M | пошук | дзвіночок */
+  /* Шапка */
   .header {
-    position: sticky;
-    top: 0;
-    z-index: 120;
-    flex-direction: row;
-    align-items: center;
+    flex-direction: column;
+    align-items: stretch;
     gap: 8px;
-    padding: max(8px, env(safe-area-inset-top)) 0 8px;
-    background: var(--bg-page);
   }
 
   .brand {
-    flex-shrink: 0;
     min-width: 0;
-    gap: 0;
+    gap: 10px;
   }
 
   .brand-text {
-    display: none;
+    min-width: 0;
+    overflow: hidden;
+  }
+
+  .brand-name,
+  .brand-user {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .logo {
-    width: 42px;
-    height: 42px;
+    width: 40px;
+    height: 40px;
     font-size: 18px;
-    border-radius: 13px;
+    border-radius: 12px;
+  }
+
+  .brand-name {
+    font-size: 16px;
+  }
+
+  .brand-user {
+    font-size: 12px;
   }
 
   .header-tools {
-    flex: 1;
-    min-width: 0;
+    width: 100%;
     max-width: none;
     margin-left: 0;
     gap: 8px;
@@ -8360,14 +8243,14 @@ button.finance-dash-card.finance-dash-card--clickable {
   .toast {
     left: 12px;
     right: 12px;
-    bottom: max(16px, env(safe-area-inset-bottom));
+    bottom: max(76px, calc(env(safe-area-inset-bottom) + 68px));
     text-align: center;
     font-size: 13px;
   }
 
   .auth-logout {
     right: 12px;
-    bottom: max(12px, env(safe-area-inset-bottom));
+    bottom: max(68px, calc(env(safe-area-inset-bottom) + 60px));
     z-index: 40;
   }
 
@@ -8404,28 +8287,12 @@ button.finance-dash-card.finance-dash-card--clickable {
 }
 
 @media (max-width: 480px) {
-  .main {
-    padding: 0 8px;
+  .app {
+    padding: 8px 8px 0;
   }
 
-  .header {
-    gap: 6px;
-    padding-bottom: 6px;
-  }
-
-  .logo {
-    width: 40px;
-    height: 40px;
-  }
-
-  .search {
-    height: 40px;
-    padding: 0 12px;
-  }
-
-  .notifications-btn {
-    width: 40px;
-    height: 40px;
+  .brand-user {
+    display: none;
   }
 
   .home-greeting .team {
@@ -8434,10 +8301,6 @@ button.finance-dash-card.finance-dash-card--clickable {
 
   .card {
     padding: 14px;
-  }
-
-  .greeting-title {
-    font-size: clamp(20px, 6vw, 26px);
   }
 
   .bazario-orders-table-card .bazario-orders-data-table {
